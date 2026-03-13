@@ -1,0 +1,184 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ParkBot Dashboard</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body { background: #1a1a2e; color: #e0e0e0; }
+    .card { background: #16213e; border: 1px solid #0f3460; }
+    .card-header { background: #0f3460; color: #e94560; font-weight: bold; }
+    #screen {
+      width: 100%;
+      max-width: 400px;
+      border: 2px solid #0f3460;
+      border-radius: 8px;
+      background: #000;
+      display: block;
+      margin: 0 auto;
+    }
+    #logs {
+      height: 300px;
+      overflow-y: auto;
+      background: #0d0d0d;
+      font-family: monospace;
+      font-size: 0.8rem;
+      padding: 10px;
+      border-radius: 4px;
+      border: 1px solid #0f3460;
+    }
+    .log-entry { color: #00ff88; margin-bottom: 2px; }
+    .log-error { color: #ff4444; }
+    .badge-running { background-color: #00ff88; color: #000; }
+    .badge-stopped { background-color: #ff4444; }
+    #status-badge { font-size: 0.9rem; }
+    .btn-start { background: #00ff88; color: #000; border: none; font-weight: bold; }
+    .btn-start:hover { background: #00cc6a; color: #000; }
+    .btn-stop { background: #e94560; border: none; font-weight: bold; }
+    .btn-stop:hover { background: #c73652; }
+  </style>
+</head>
+<body>
+<div class="container-fluid py-3">
+  <div class="row mb-3">
+    <div class="col">
+      <h2 class="text-center" style="color:#e94560;">&#128663; ParkBot Dashboard</h2>
+    </div>
+  </div>
+
+  <div class="row g-3">
+    <!-- Left: Controls -->
+    <div class="col-md-4">
+      <div class="card mb-3">
+        <div class="card-header">Steuerung</div>
+        <div class="card-body">
+          <div class="mb-3">
+            <label class="form-label">Kennzeichen</label>
+            <input type="text" id="plate-input" class="form-control bg-dark text-white border-secondary"
+                   placeholder="z.B. W123AB" maxlength="10" style="text-transform:uppercase;">
+          </div>
+          <div class="d-grid gap-2">
+            <button class="btn btn-start" id="btn-start" onclick="startBot()">&#9654; Start</button>
+            <button class="btn btn-stop" id="btn-stop" onclick="stopBot()">&#9632; Stop</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="card mb-3">
+        <div class="card-header">Status</div>
+        <div class="card-body text-center">
+          <span class="badge badge-stopped px-3 py-2" id="status-badge">Gestoppt</span>
+          <div class="mt-2 small" id="health-info">Verbindung wird geprüft ...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Center: Emulator Screen -->
+    <div class="col-md-4">
+      <div class="card">
+        <div class="card-header">Emulator Screen</div>
+        <div class="card-body text-center p-2">
+          <img id="screen" src="/video_feed" alt="Emulator Screen"
+               onerror="this.src='data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%22400%22 height=%22600%22><rect width=%22400%22 height=%22600%22 fill=%22%23111%22/><text x=%22200%22 y=%22300%22 fill=%22%23555%22 text-anchor=%22middle%22 font-size=%2220%22>Kein Signal</text></svg>'">
+        </div>
+      </div>
+    </div>
+
+    <!-- Right: Logs -->
+    <div class="col-md-4">
+      <div class="card">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          Live Logs
+          <button class="btn btn-sm btn-outline-secondary" onclick="clearLogs()">Löschen</button>
+        </div>
+        <div class="card-body p-2">
+          <div id="logs"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const logsDiv = document.getElementById('logs');
+  const statusBadge = document.getElementById('status-badge');
+  const healthInfo = document.getElementById('health-info');
+
+  function addLog(msg, isError = false) {
+    const ts = new Date().toLocaleTimeString('de-AT');
+    const div = document.createElement('div');
+    div.className = isError ? 'log-entry log-error' : 'log-entry';
+    div.textContent = `[${ts}] ${msg}`;
+    logsDiv.appendChild(div);
+    logsDiv.scrollTop = logsDiv.scrollHeight;
+  }
+
+  function clearLogs() {
+    logsDiv.innerHTML = '';
+  }
+
+  const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(`${wsProto}//${location.host}/ws/logs`);
+  ws.onopen = () => addLog('WebSocket verbunden.');
+  ws.onmessage = e => addLog(e.data);
+  ws.onerror = e => addLog('WebSocket Fehler.', true);
+  ws.onclose = () => {
+    addLog('WebSocket getrennt. Reconnect in 3s ...', true);
+    setTimeout(() => location.reload(), 3000);
+  };
+
+  async function startBot() {
+    const plate = document.getElementById('plate-input').value.trim().toUpperCase();
+    if (!plate) { addLog('Bitte Kennzeichen eingeben!', true); return; }
+    addLog(`Starte Bot für ${plate} ...`);
+    try {
+      const resp = await fetch('/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ license_plate: plate })
+      });
+      const data = await resp.json();
+      if (data.error) { addLog(`Fehler: ${data.error}`, true); }
+      else { updateStatus(true); }
+    } catch (e) { addLog(`Fehler: ${e}`, true); }
+  }
+
+  async function stopBot() {
+    addLog('Stoppe Bot ...');
+    try {
+      await fetch('/stop', { method: 'POST' });
+      updateStatus(false);
+    } catch (e) { addLog(`Fehler: ${e}`, true); }
+  }
+
+  function updateStatus(running) {
+    if (running) {
+      statusBadge.textContent = 'Läuft';
+      statusBadge.className = 'badge badge-running px-3 py-2';
+    } else {
+      statusBadge.textContent = 'Gestoppt';
+      statusBadge.className = 'badge badge-stopped px-3 py-2';
+    }
+  }
+
+  async function checkHealth() {
+    try {
+      const resp = await fetch('/health');
+      const data = await resp.json();
+      healthInfo.textContent = `Emulator: ${data.emulator} | Bot: ${data.bot}`;
+      updateStatus(data.bot === 'running');
+    } catch (e) {
+      healthInfo.textContent = 'Health-Check fehlgeschlagen.';
+    }
+  }
+
+  document.getElementById('plate-input').addEventListener('input', function() {
+    this.value = this.value.toUpperCase();
+  });
+
+  checkHealth();
+  setInterval(checkHealth, 5000);
+</script>
+</body>
+</html>

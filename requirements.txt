@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+adb-shell
+lxml
+opencv-python-headless
+websockets
+requests
+numpy

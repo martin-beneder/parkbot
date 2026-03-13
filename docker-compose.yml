@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  emulator:
+    image: redroid/redroid:11.0.0
+    cap_add:
+      - SYS_ADMIN
+    ports:
+      - "5555:5555"
+    volumes:
+      - emulator_data:/data
+    restart: unless-stopped
+
+  controller:
+    build: .
+    ports:
+      - "8000:8000"
+    depends_on:
+      - emulator
+    environment:
+      - ADB_HOST=emulator
+      - ADB_PORT=5555
+    volumes:
+      - ./apk:/apk
+      - ./frontend:/frontend
+    restart: unless-stopped
+
+volumes:
+  emulator_data:
