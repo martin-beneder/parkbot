@@ -1,10 +1,14 @@
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y \
-    android-tools-adb \
-    libgl1-mesa-glx \
-    libglib2.0-0 \
-    curl \
+RUN apt-get update -o Acquire::ForceIPv4=true \
+    && apt-get install -y --no-install-recommends \
+        android-tools-adb \
+        libgl1 \
+        libglib2.0-0 \
+        libsm6 \
+        libxrender1 \
+        libxext6 \
+        curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
