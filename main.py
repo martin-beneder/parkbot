@@ -280,13 +280,24 @@ apk_installer = APKInstaller(adb_manager)
 bot_controller = BotController(adb_manager)
 
 
+def _wait_for_emulator_and_install() -> None:
+    """Retry ADB connection until the emulator is ready, then install APK."""
+    log_and_broadcast("Warte auf Android-Emulator (kann 2-5 Minuten dauern) ...")
+    for attempt in range(60):
+        if adb_manager.connect():
+            apk_installer.ensure_installed()
+            return
+        log_and_broadcast(f"Emulator noch nicht bereit, warte ... ({attempt + 1}/60)")
+        time.sleep(10)
+    log_and_broadcast("Emulator nicht erreichbar nach 10 Minuten. Bitte manuell prüfen.")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _main_loop
     _main_loop = asyncio.get_event_loop()
     log_and_broadcast("ParkBot startet ...")
-    adb_manager.connect()
-    threading.Thread(target=apk_installer.ensure_installed, daemon=True).start()
+    threading.Thread(target=_wait_for_emulator_and_install, daemon=True).start()
     yield
     bot_controller.stop()
 
