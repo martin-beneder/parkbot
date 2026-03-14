@@ -646,30 +646,30 @@ class BotController:
     def _handle_plate_picker_list(self, root) -> str:
         """Handle an open plate-picker dropdown.
         Returns 'selected' if our plate was tapped, 'handled' if other action taken, '' if not open."""
+        # Picker is open only when select_dialog_listview is present
+        if not root.xpath('//node[@resource-id="at.mobilkom.android.handyparken:id/select_dialog_listview"]'):
+            # Also check generic listview as fallback
+            if not root.xpath('//node[@class="android.widget.ListView"]'):
+                return ""
+
         plate = self.license_plate.upper()
 
-        # Our plate visible as a selectable item → tap it
-        for n in root.xpath(f'//node[@text="{plate}"]') + root.xpath(f'//node[@text="{self.license_plate}"]'):
-            if n.get("clickable") == "true":
+        # Find plate text inside picker — items have clickable=false in dump but ARE tappable
+        for n in root.xpath(f'//node[@resource-id="{PACKAGE}:id/licenseplate_number"]'):
+            t = (n.get("text") or "").upper().strip()
+            if t == plate:
                 c = self._parse_bounds(n.get("bounds", ""))
                 if c:
-                    log_and_broadcast(f"Kennzeichen {plate} in Liste — wähle aus ...")
+                    log_and_broadcast(f"Kennzeichen {plate} in Picker — wähle aus ...")
                     self.adb.run(["shell", "input", "tap", str(c[0]), str(c[1])])
                     time.sleep(1.0)
                     return "selected"
 
-        # Picker open (list/dialog visible) but our plate not in it → close it
-        has_list = bool(
-            root.xpath('//node[@class="android.widget.ListView"]') +
-            root.xpath('//node[@class="androidx.recyclerview.widget.RecyclerView"]')
-        )
-        if has_list:
-            log_and_broadcast("Kennzeichen nicht in Auswahlliste — schließe ...")
-            self.adb.run(["shell", "input", "keyevent", "KEYCODE_BACK"])
-            time.sleep(0.5)
-            return "handled"
-
-        return ""
+        # Picker open but our plate not in it → close and go add it
+        log_and_broadcast(f"Kennzeichen {plate} nicht in Picker — schließe ...")
+        self.adb.run(["shell", "input", "keyevent", "KEYCODE_BACK"])
+        time.sleep(0.5)
+        return "handled"
 
     def _handle_plate_manage_screen(self, root) -> bool:
         """Handle 'Kennzeichen verwalten' screen.
@@ -679,33 +679,32 @@ class BotController:
 
         plate = self.license_plate.upper()
 
-        # If our plate is already in the list as a selectable item → tap it (selects for booking)
-        for n in root.xpath(f'//node[@text="{plate}"]') + root.xpath(f'//node[@text="{self.license_plate}"]'):
-            if n.get("clickable") == "true":
-                c = self._parse_bounds(n.get("bounds", ""))
-                if c:
-                    log_and_broadcast(f"Kennzeichen {plate} in Verwaltung — wähle aus ...")
-                    self.adb.run(["shell", "input", "tap", str(c[0]), str(c[1])])
-                    time.sleep(1.0)
-                    return True
+        # If our plate is already in the manage list → press BACK to go back to booking.
+        # Selection for booking happens through the picker spinner, not the manage list.
+        for n in root.xpath(f'//node[@resource-id="{PACKAGE}:id/licenseplate_number"]'):
+            if (n.get("text") or "").upper().strip() == plate:
+                log_and_broadcast(f"Kennzeichen {plate} in Verwaltung gespeichert — zurück zur Buchung ...")
+                self.adb.run(["shell", "input", "keyevent", "KEYCODE_BACK"])
+                time.sleep(1.0)
+                return True
 
-        # Plate not in list → tap empty list ("Tippen Sie hier") or add button
+        # Plate not in list yet → need to add it
+        # If there are no plates at all, the empty-state text is clickable
         empty = root.xpath(f'//node[@resource-id="{PACKAGE}:id/licenseplatemanagerlist_empty"]')
         if empty:
             c = self._parse_bounds(empty[0].get("bounds", ""))
             if c:
-                # Tap near the top of the area, not the full-screen bounds
                 log_and_broadcast("Kennzeichen-Liste leer — öffne Hinzufügen-Formular ...")
                 self.adb.run(["shell", "input", "tap", str(c[0] + 360), str(c[1] + 50)])
                 time.sleep(1.5)
                 return True
 
-        # Fallback: tap the + button in the action bar
+        # Plates exist but ours is not among them → tap + button
         add_btn = root.xpath(f'//node[@resource-id="{PACKAGE}:id/menuaction_add_licenseplate"]')
         if add_btn:
             c = self._parse_bounds(add_btn[0].get("bounds", ""))
             if c:
-                log_and_broadcast("Tippe Hinzufügen-Button ...")
+                log_and_broadcast("Kennzeichen nicht in Verwaltung — tippe Hinzufügen ...")
                 self.adb.run(["shell", "input", "tap", str(c[0]), str(c[1])])
                 time.sleep(1.5)
                 return True
@@ -716,8 +715,15 @@ class BotController:
         """Handle 'Kennzeichen hinzufügen' input form.
         Returns True if an action was taken."""
         from lxml import etree as _etree
-        inp = root.xpath(f'//node[@resource-id="{PACKAGE}:id/licenseplate_number"]')
+        # Must be an EditText (not the booking-screen spinner's TextView child)
+        # AND the save button must be present — otherwise we're on the booking screen
+        inp = root.xpath(
+            f'//node[@resource-id="{PACKAGE}:id/licenseplate_number"'
+            f' and @class="android.widget.EditText"]'
+        )
         if not inp:
+            return False
+        if not root.xpath(f'//node[@resource-id="{PACKAGE}:id/licenseplate_save_button"]'):
             return False
 
         log_and_broadcast(f"Kennzeichen-Formular erkannt — trage {self.license_plate} ein ...")
@@ -774,7 +780,7 @@ class BotController:
         plate_selection_done = False  # True after plate was picked from dropdown
         plate_form_submitted = False  # True after SPEICHERN was tapped in add form
         picker_tried = False          # True after picker was opened at least once
-        buchen_tapped = False
+        booking_submitted = False     # True after BUCHUNG BESTÄTIGEN was tapped
 
         while time.time() < deadline and self.running:
             xml = self._dump_ui()
@@ -808,24 +814,38 @@ class BotController:
 
             login_tried = False
 
-            # ── After BUCHEN: check if we left the booking screen ──────────────
-            if buchen_tapped:
-                if not self._is_booking_screen(root):
+            # ── After BUCHUNG BESTÄTIGEN was tapped ───────────────────────────
+            if booking_submitted:
+                if self._is_booking_screen(root):
                     log_and_broadcast("Parkschein erfolgreich gebucht!")
                     return True
-                buchen_tapped = False  # Still on booking screen — possible confirm needed
+                # Still on confirmation screen (dialog was informational) → press BACK
+                if root.xpath(f'//node[@resource-id="{PACKAGE}:id/orderpreview_submit"]'):
+                    log_and_broadcast("Buchung abgeschlossen — zurück zur Buchungsansicht ...")
+                    self.adb.run(["shell", "input", "keyevent", "KEYCODE_BACK"])
+                    time.sleep(1.5)
+                    continue
+
+            # ── Booking confirmation screen ("Buchung bestätigen") ────────────
+            if not booking_submitted:
+                confirm = root.xpath(f'//node[@resource-id="{PACKAGE}:id/orderpreview_submit"]')
+                if confirm:
+                    c = self._parse_bounds(confirm[0].get("bounds", ""))
+                    if c:
+                        log_and_broadcast("Buchungsbestätigung — bestätige ...")
+                        self.adb.run(["shell", "input", "tap", str(c[0]), str(c[1])])
+                        booking_submitted = True
+                        time.sleep(3)
+                    continue
 
             # ── Add-plate form ("Kennzeichen hinzufügen") ──────────────────────
-            # Only submit once; if already submitted and still on form (duplicate error),
-            # press BACK instead (unknown-screen handler below will do it)
+            # Only submit once — if still on form after submit (duplicate), BACK instead
             if not plate_form_submitted and self._handle_add_plate_form(root):
                 plate_form_submitted = True
                 continue
 
             # ── Plate manage screen ("Kennzeichen verwalten") ──────────────────
             if self._handle_plate_manage_screen(root):
-                if plate_form_submitted:
-                    plate_selection_done = True  # manage screen after add → plate auto-selects
                 continue
 
             # ── Plate picker dropdown ──────────────────────────────────────────
@@ -834,7 +854,6 @@ class BotController:
                 plate_selection_done = True
                 continue
             if result == "handled":
-                # Picker was open but plate not in it → navigate to add flow
                 if not plate_form_submitted:
                     picker_tried = True
                 continue
@@ -842,22 +861,21 @@ class BotController:
             # ── Booking screen ─────────────────────────────────────────────────
             if self._is_booking_screen(root):
                 if plate_selection_done or self._is_plate_selected(root):
-                    if self._tap_buchen(root):
-                        buchen_tapped = True
-                        time.sleep(3)
+                    self._tap_buchen(root)
+                    time.sleep(3)
                 elif plate_form_submitted:
-                    # Plate was added, open picker to select it
+                    # Plate was just added — open picker to select it
                     self._open_plate_picker(root)
                 elif not picker_tried:
-                    # First: try picker (plate might already be saved from prior run)
+                    # First attempt: try picker (plate may already be saved)
                     self._open_plate_picker(root)
                     picker_tried = True
                 else:
-                    # Picker was empty → go to manage screen to add plate
+                    # Picker didn't have the plate → go to manage to add it
                     self._tap_add_plate_button(root)
                 continue
 
-            # ── Unknown screen (e.g. duplicate-error dismissed, still on add form)
+            # ── Unknown screen — navigate back ─────────────────────────────────
             log_and_broadcast("Unbekannter Bildschirm — zurück ...")
             self.adb.run(["shell", "input", "keyevent", "KEYCODE_BACK"])
             time.sleep(2)
