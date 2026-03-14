@@ -806,8 +806,10 @@ class BotController:
             xml = self._dump_ui()
             if not xml:
                 break
-            r2 = self._parse_ui(xml)
-            if r2 is None:
+            try:
+                from lxml import etree as _et
+                r2 = _et.fromstring(xml.encode())
+            except Exception:
                 break
             v2 = r2.xpath(f'//node[@resource-id="{PACKAGE}:id/pboi_value"]')
             if not v2:
@@ -927,9 +929,10 @@ class BotController:
                     # Re-dump after duration changes to get fresh root for BUCHEN
                     xml2 = self._dump_ui()
                     if xml2:
-                        root2 = self._parse_ui(xml2)
-                        if root2 is not None:
-                            root = root2
+                        try:
+                            root = etree.fromstring(xml2.encode())
+                        except etree.XMLSyntaxError:
+                            pass
                     self._tap_buchen(root)
                     time.sleep(3)
                 elif plate_form_submitted:
