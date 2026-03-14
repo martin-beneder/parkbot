@@ -498,6 +498,34 @@ class BotController:
         self._type_text(text)
         time.sleep(0.3)
 
+    # ── dialog / permission dismissal ────────────────────────────────────────
+
+    # Buttons we want to tap to accept/dismiss dialogs (order matters: prefer fine-grained over broad)
+    _DIALOG_ACCEPT = [
+        "Nur diesmal",                          # location: only this time
+        "Während der App-Nutzung zulassen",     # location: while using app
+        "Beim Verwenden der App",               # location: variant
+        "Zulassen",                             # generic allow
+        "ZULASSEN",
+        "Erlauben",
+        "ERLAUBEN",
+        "OK",
+        "Ok",
+    ]
+
+    def _handle_dialogs(self, root) -> bool:
+        """Detect and dismiss permission/info dialogs. Returns True if something was tapped."""
+        for label in self._DIALOG_ACCEPT:
+            nodes = root.xpath(f'//node[@text="{label}"]')
+            if nodes:
+                coords = self._parse_bounds(nodes[0].get("bounds", ""))
+                if coords:
+                    log_and_broadcast(f"Dialog erkannt — tippe '{label}' ...")
+                    self.adb.run(["shell", "input", "tap", str(coords[0]), str(coords[1])])
+                    time.sleep(1.5)
+                    return True
+        return False
+
     # ── login detection & automation ──────────────────────────────────────────
 
     _LOGIN_IDS = {
@@ -588,6 +616,10 @@ class BotController:
                 log_and_broadcast(f"XML Parsefehler: {e}")
                 time.sleep(2)
                 continue
+
+            # ── Dialogs / permissions? ────────────────────────────────────────
+            if self._handle_dialogs(root):
+                continue  # re-dump after dismissing
 
             # ── Login screen? ─────────────────────────────────────────────────
             if self._is_login_screen(root):
