@@ -28,15 +28,24 @@
       border-radius: 4px;
       border: 1px solid #0f3460;
     }
-    .log-entry { color: #00ff88; margin-bottom: 2px; }
-    .log-error { color: #ff4444; }
-    .badge-running { background-color: #00ff88; color: #000; }
-    .badge-stopped { background-color: #ff4444; }
+    .log-entry  { color: #00ff88; margin-bottom: 2px; }
+    .log-warn   { color: #ffaa00; margin-bottom: 2px; }
+    .log-error  { color: #ff4444; margin-bottom: 2px; }
+    .badge-running    { background-color: #00ff88 !important; color: #000 !important; }
+    .badge-stopped    { background-color: #ff4444 !important; }
+    .badge-installed  { background-color: #00ff88 !important; color: #000 !important; }
+    .badge-pending    { background-color: #888 !important; }
+    .badge-downloading{ background-color: #ffaa00 !important; color: #000 !important; }
+    .badge-installing { background-color: #0dcaf0 !important; color: #000 !important; }
+    .badge-failed     { background-color: #ff4444 !important; }
     #status-badge { font-size: 0.9rem; }
+    #apk-badge    { font-size: 0.8rem; }
     .btn-start { background: #00ff88; color: #000; border: none; font-weight: bold; }
-    .btn-start:hover { background: #00cc6a; color: #000; }
-    .btn-stop { background: #e94560; border: none; font-weight: bold; }
+    .btn-start:hover:not(:disabled) { background: #00cc6a; color: #000; }
+    .btn-start:disabled { background: #444; color: #888; border: none; cursor: not-allowed; }
+    .btn-stop  { background: #e94560; border: none; font-weight: bold; }
     .btn-stop:hover { background: #c73652; }
+    .apk-info { font-size: 0.75rem; color: #888; margin-top: 4px; min-height: 1.2em; }
   </style>
 </head>
 <body>
@@ -59,16 +68,24 @@
                    placeholder="z.B. W123AB" maxlength="10" style="text-transform:uppercase;">
           </div>
           <div class="d-grid gap-2">
-            <button class="btn btn-start" id="btn-start" onclick="startBot()">&#9654; Start</button>
+            <button class="btn btn-start" id="btn-start" onclick="startBot()" disabled>
+              &#9654; Start
+            </button>
             <button class="btn btn-stop" id="btn-stop" onclick="stopBot()">&#9632; Stop</button>
           </div>
+          <div class="apk-info text-center" id="apk-hint">Warte auf App-Installation ...</div>
         </div>
       </div>
 
       <div class="card mb-3">
         <div class="card-header">Status</div>
         <div class="card-body text-center">
-          <span class="badge badge-stopped px-3 py-2" id="status-badge">Gestoppt</span>
+          <div class="mb-2">
+            <span class="badge badge-stopped px-3 py-2" id="status-badge">Bot: Gestoppt</span>
+          </div>
+          <div>
+            <span class="badge badge-pending px-2 py-1" id="apk-badge">APK: wird geprüft ...</span>
+          </div>
           <div class="mt-2 small" id="health-info">Verbindung wird geprüft ...</div>
         </div>
       </div>
@@ -101,79 +118,127 @@
 </div>
 
 <script>
-  const logsDiv = document.getElementById('logs');
+  const logsDiv     = document.getElementById('logs');
   const statusBadge = document.getElementById('status-badge');
-  const healthInfo = document.getElementById('health-info');
+  const apkBadge    = document.getElementById('apk-badge');
+  const healthInfo  = document.getElementById('health-info');
+  const btnStart    = document.getElementById('btn-start');
+  const apkHint     = document.getElementById('apk-hint');
 
-  function addLog(msg, isError = false) {
-    const ts = new Date().toLocaleTimeString('de-AT');
+  // ── Logging ──────────────────────────────────────────────────────────────
+
+  function addLog(msg, cls = 'log-entry') {
+    const ts  = new Date().toLocaleTimeString('de-AT');
     const div = document.createElement('div');
-    div.className = isError ? 'log-entry log-error' : 'log-entry';
+    div.className = cls;
     div.textContent = `[${ts}] ${msg}`;
     logsDiv.appendChild(div);
     logsDiv.scrollTop = logsDiv.scrollHeight;
+    // Limit log entries to 200
+    while (logsDiv.children.length > 200) logsDiv.removeChild(logsDiv.firstChild);
   }
 
-  function clearLogs() {
-    logsDiv.innerHTML = '';
+  function logClass(msg) {
+    const lower = msg.toLowerCase();
+    if (lower.includes('fehler') || lower.includes('error') || lower.includes('fehlgeschlagen'))
+      return 'log-error';
+    if (lower.includes('warte') || lower.includes('nicht gefunden') || lower.includes('warn'))
+      return 'log-warn';
+    return 'log-entry';
   }
+
+  function clearLogs() { logsDiv.innerHTML = ''; }
+
+  // ── WebSocket ─────────────────────────────────────────────────────────────
 
   const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const ws = new WebSocket(`${wsProto}//${location.host}/ws/logs`);
-  ws.onopen = () => addLog('WebSocket verbunden.');
-  ws.onmessage = e => addLog(e.data);
-  ws.onerror = e => addLog('WebSocket Fehler.', true);
-  ws.onclose = () => {
-    addLog('WebSocket getrennt. Reconnect in 3s ...', true);
+  ws.onopen    = () => addLog('WebSocket verbunden.');
+  ws.onmessage = e  => addLog(e.data, logClass(e.data));
+  ws.onerror   = () => addLog('WebSocket Fehler.', 'log-error');
+  ws.onclose   = () => {
+    addLog('WebSocket getrennt. Reconnect in 3s ...', 'log-warn');
     setTimeout(() => location.reload(), 3000);
   };
 
+  // ── APK status ────────────────────────────────────────────────────────────
+
+  const APK_LABELS = {
+    pending:     'APK: wird geprüft ...',
+    downloading: 'APK: wird heruntergeladen ...',
+    installing:  'APK: wird installiert ...',
+    installed:   'APK: installiert ✓',
+    failed:      'APK: fehlgeschlagen ✗',
+  };
+
+  const APK_HINTS = {
+    pending:     'Warte auf App-Installation ...',
+    downloading: 'APK wird heruntergeladen, bitte warten ...',
+    installing:  'APK wird installiert, bitte warten ...',
+    installed:   '',
+    failed:      'APK konnte nicht automatisch installiert werden. Datei unter apk/handyparken.apk ablegen und Container neu starten.',
+  };
+
+  function updateApkStatus(status) {
+    apkBadge.textContent = APK_LABELS[status] || `APK: ${status}`;
+    apkBadge.className   = `badge badge-${status} px-2 py-1`;
+    apkHint.textContent  = APK_HINTS[status] ?? '';
+
+    const ready = (status === 'installed');
+    btnStart.disabled = !ready;
+    if (!ready && status === 'failed') {
+      apkHint.style.color = '#ff4444';
+    } else {
+      apkHint.style.color = '#888';
+    }
+  }
+
+  // ── Bot status ────────────────────────────────────────────────────────────
+
+  function updateBotStatus(running) {
+    statusBadge.textContent = running ? 'Bot: Läuft' : 'Bot: Gestoppt';
+    statusBadge.className   = `badge ${running ? 'badge-running' : 'badge-stopped'} px-3 py-2`;
+  }
+
+  // ── Health poll ───────────────────────────────────────────────────────────
+
+  async function checkHealth() {
+    try {
+      const data = await fetch('/health').then(r => r.json());
+      healthInfo.textContent = `Emulator: ${data.emulator} | Bot: ${data.bot}`;
+      updateBotStatus(data.bot === 'running');
+      updateApkStatus(data.apk || 'pending');
+    } catch {
+      healthInfo.textContent = 'Health-Check fehlgeschlagen.';
+    }
+  }
+
+  // ── Controls ──────────────────────────────────────────────────────────────
+
   async function startBot() {
     const plate = document.getElementById('plate-input').value.trim().toUpperCase();
-    if (!plate) { addLog('Bitte Kennzeichen eingeben!', true); return; }
+    if (!plate) { addLog('Bitte Kennzeichen eingeben!', 'log-error'); return; }
     addLog(`Starte Bot für ${plate} ...`);
     try {
-      const resp = await fetch('/start', {
+      const data = await fetch('/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ license_plate: plate })
-      });
-      const data = await resp.json();
-      if (data.error) { addLog(`Fehler: ${data.error}`, true); }
-      else { updateStatus(true); }
-    } catch (e) { addLog(`Fehler: ${e}`, true); }
+      }).then(r => r.json());
+      if (data.error) addLog(`Fehler: ${data.error}`, 'log-error');
+      else updateBotStatus(true);
+    } catch (e) { addLog(`Fehler: ${e}`, 'log-error'); }
   }
 
   async function stopBot() {
     addLog('Stoppe Bot ...');
     try {
       await fetch('/stop', { method: 'POST' });
-      updateStatus(false);
-    } catch (e) { addLog(`Fehler: ${e}`, true); }
+      updateBotStatus(false);
+    } catch (e) { addLog(`Fehler: ${e}`, 'log-error'); }
   }
 
-  function updateStatus(running) {
-    if (running) {
-      statusBadge.textContent = 'Läuft';
-      statusBadge.className = 'badge badge-running px-3 py-2';
-    } else {
-      statusBadge.textContent = 'Gestoppt';
-      statusBadge.className = 'badge badge-stopped px-3 py-2';
-    }
-  }
-
-  async function checkHealth() {
-    try {
-      const resp = await fetch('/health');
-      const data = await resp.json();
-      healthInfo.textContent = `Emulator: ${data.emulator} | Bot: ${data.bot}`;
-      updateStatus(data.bot === 'running');
-    } catch (e) {
-      healthInfo.textContent = 'Health-Check fehlgeschlagen.';
-    }
-  }
-
-  document.getElementById('plate-input').addEventListener('input', function() {
+  document.getElementById('plate-input').addEventListener('input', function () {
     this.value = this.value.toUpperCase();
   });
 

@@ -14,7 +14,7 @@ import numpy as np
 import requests
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, StreamingResponse
-from lxml import etree
+from lxml import html as lxhtml
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -46,6 +46,8 @@ def log_and_broadcast(message: str) -> None:
         asyncio.run_coroutine_threadsafe(_broadcast(message), _main_loop)
 
 
+# ── ADB ──────────────────────────────────────────────────────────────────────
+
 class ADBManager:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -58,41 +60,35 @@ class ADBManager:
             )
             success = "connected" in result.stdout.lower() or "already connected" in result.stdout.lower()
             if success:
-                log_and_broadcast(f"ADB connected to {DEVICE}")
+                log_and_broadcast(f"ADB verbunden mit {DEVICE}")
             else:
-                log_and_broadcast(f"ADB connect failed: {result.stdout.strip()} {result.stderr.strip()}")
+                log_and_broadcast(f"ADB connect fehlgeschlagen: {result.stdout.strip()} {result.stderr.strip()}")
             return success
         except Exception as e:
-            log_and_broadcast(f"ADB connect error: {e}")
+            log_and_broadcast(f"ADB connect Fehler: {e}")
             return False
 
     def run(self, cmd: list[str], timeout: int = 30, capture: bool = True) -> Optional[subprocess.CompletedProcess]:
         full_cmd = ["adb", "-s", DEVICE] + cmd
         with self._lock:
             try:
-                result = subprocess.run(
-                    full_cmd,
-                    capture_output=capture,
-                    timeout=timeout
-                )
+                result = subprocess.run(full_cmd, capture_output=capture, timeout=timeout)
                 return result
             except subprocess.TimeoutExpired:
-                log_and_broadcast(f"ADB timeout: {' '.join(cmd)}")
+                log_and_broadcast(f"ADB Timeout: {' '.join(cmd)}")
                 return None
             except Exception as e:
-                log_and_broadcast(f"ADB error: {e} — attempting reconnect")
+                log_and_broadcast(f"ADB Fehler: {e} — versuche Reconnect")
                 self.connect()
                 try:
                     return subprocess.run(full_cmd, capture_output=capture, timeout=timeout)
                 except Exception as e2:
-                    log_and_broadcast(f"ADB reconnect failed: {e2}")
+                    log_and_broadcast(f"ADB Reconnect fehlgeschlagen: {e2}")
                     return None
 
     def is_connected(self) -> bool:
         result = self.run(["shell", "echo", "ok"], timeout=5)
-        if result is None:
-            return False
-        return result.returncode == 0
+        return result is not None and result.returncode == 0
 
     def screencap(self) -> Optional[bytes]:
         full_cmd = ["adb", "-s", DEVICE, "exec-out", "screencap", "-p"]
@@ -102,19 +98,189 @@ class ADBManager:
                 if result.returncode == 0 and result.stdout:
                     return result.stdout
             except Exception as e:
-                log_and_broadcast(f"Screencap error: {e}")
+                log_and_broadcast(f"Screencap Fehler: {e}")
         return None
 
+
+# ── APK Installer ─────────────────────────────────────────────────────────────
 
 class APKInstaller:
     def __init__(self, adb: ADBManager) -> None:
         self.adb = adb
+        self.status: str = "pending"  # pending | downloading | installing | installed | failed
 
     def is_installed(self) -> bool:
         result = self.adb.run(["shell", "pm", "list", "packages", PACKAGE])
         if result is None:
             return False
         return PACKAGE in result.stdout.decode(errors="replace")
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _stream_to_file(self, resp: requests.Response) -> bool:
+        ct = resp.headers.get("Content-Type", "").lower()
+        if "text/html" in ct:
+            return False
+        content_length = int(resp.headers.get("Content-Length", 0))
+        if content_length and content_length < 1_000_000:
+            return False
+        total = 0
+        Path(APK_PATH).parent.mkdir(parents=True, exist_ok=True)
+        with open(APK_PATH, "wb") as f:
+            for chunk in resp.iter_content(1 << 16):
+                f.write(chunk)
+                total += len(chunk)
+                if total % (5 << 20) == 0:  # log every 5 MB
+                    log_and_broadcast(f"APK Download: {total // (1 << 20)} MB ...")
+        if total < 1_000_000:
+            Path(APK_PATH).unlink(missing_ok=True)
+            return False
+        return True
+
+    @staticmethod
+    def _get(session: requests.Session, url: str, referer: str = "",
+             stream: bool = False, mobile: bool = False) -> requests.Response:
+        ua = (
+            "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36"
+            if mobile else
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        )
+        headers = {"User-Agent": ua}
+        if referer:
+            headers["Referer"] = referer
+        return session.get(url, headers=headers, timeout=30,
+                           stream=stream, allow_redirects=True)
+
+    def _try_hrefs(self, session: requests.Session, hrefs: list[str],
+                   referer: str, base: str = "") -> bool:
+        for href in hrefs:
+            if href.startswith("/") and base:
+                href = base + href
+            if not href.startswith("http"):
+                continue
+            r = self._get(session, href, referer=referer, stream=True)
+            if self._stream_to_file(r):
+                return True
+        return False
+
+    # ── source 1: APKPure ─────────────────────────────────────────────────────
+
+    def _dl_apkpure(self) -> bool:
+        s = requests.Session()
+        base = "https://apkpure.com"
+        app_url = f"{base}/handyparken/{PACKAGE}"
+        dl_url = f"{app_url}/download"
+
+        s.get(app_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15)  # seed cookies
+        r = self._get(s, dl_url, referer=app_url)
+        r.raise_for_status()
+        tree = lxhtml.fromstring(r.content)
+
+        hrefs = (
+            tree.xpath('//*[@id="download_link"]/@href') +
+            tree.xpath('//a[contains(@class,"download-start")]/@href') +
+            tree.xpath('//a[contains(@href,"d.apkpure.com")]/@href') +
+            tree.xpath('//*[@data-dt-url]/@data-dt-url') +
+            tree.xpath('//a[contains(@href,".apk")]/@href')
+        )
+        if self._try_hrefs(s, hrefs, referer=dl_url, base=base):
+            return True
+
+        # Regex: catch any APKPure CDN URL embedded in HTML/JS
+        for m in re.finditer(r'https://(?:d|cdn\d*)\.apkpure\.(?:com|net)[^\s"\'<>]+', r.text):
+            r2 = self._get(s, m.group(), referer=dl_url, stream=True)
+            if self._stream_to_file(r2):
+                return True
+
+        # Direct URL variations
+        for url in [
+            f"https://d.apkpure.com/b/APK/{PACKAGE}?version=latest",
+            f"https://d.apkpure.com/b/APK/{PACKAGE}?version=latest&nc=1&nf=1",
+        ]:
+            r3 = self._get(s, url, referer=dl_url, stream=True)
+            if self._stream_to_file(r3):
+                return True
+
+        return False
+
+    # ── source 2: Uptodown ────────────────────────────────────────────────────
+
+    def _dl_uptodown(self) -> bool:
+        s = requests.Session()
+        base = "https://handyparken.at.uptodown.com"
+
+        r = self._get(s, f"{base}/android")
+        r.raise_for_status()
+        tree = lxhtml.fromstring(r.content)
+
+        hrefs = (
+            tree.xpath('//*[@id="detail-download-button"]/@href') +
+            tree.xpath('//*[@data-url]/@data-url') +
+            tree.xpath('//a[contains(@href,".apk")]/@href')
+        )
+        if self._try_hrefs(s, hrefs, referer=base, base=base):
+            return True
+
+        r2 = self._get(s, f"{base}/android/download", referer=f"{base}/android")
+        tree2 = lxhtml.fromstring(r2.content)
+        hrefs2 = tree2.xpath('//a[contains(@href,".apk")]/@href')
+        return self._try_hrefs(s, hrefs2, referer=r2.url, base=base)
+
+    # ── source 3: APKCombo ────────────────────────────────────────────────────
+
+    def _dl_apkcombo(self) -> bool:
+        s = requests.Session()
+        base = "https://apkcombo.com"
+        page = f"{base}/handyparken/{PACKAGE}/download/apk"
+
+        r = self._get(s, page)
+        r.raise_for_status()
+        tree = lxhtml.fromstring(r.content)
+
+        hrefs = (
+            tree.xpath('//a[contains(@class,"variant")]/@href') +
+            tree.xpath('//a[contains(@href,".apk")]/@href') +
+            tree.xpath('//a[contains(@class,"download")]/@href')
+        )
+        if self._try_hrefs(s, hrefs, referer=page, base=base):
+            return True
+
+        for m in re.finditer(r'https://[^\s"\'<>]+\.apk[^\s"\'<>]*', r.text):
+            r2 = self._get(s, m.group(), referer=page, stream=True)
+            if self._stream_to_file(r2):
+                return True
+
+        return False
+
+    # ── source 4: APKMonk ─────────────────────────────────────────────────────
+
+    def _dl_apkmonk(self) -> bool:
+        s = requests.Session()
+        base = "https://www.apkmonk.com"
+        page = f"{base}/app/{PACKAGE}/"
+
+        try:
+            r = self._get(s, page)
+            r.raise_for_status()
+            tree = lxhtml.fromstring(r.content)
+            for href in tree.xpath('//a[contains(@href,"download")]/@href'):
+                if href.startswith("/"):
+                    href = base + href
+                if not href.startswith("http"):
+                    continue
+                r2 = self._get(s, href, referer=page)
+                tree2 = lxhtml.fromstring(r2.content)
+                for dl_href in tree2.xpath('//a[contains(@href,".apk")]/@href'):
+                    r3 = self._get(s, dl_href, referer=href, stream=True)
+                    if self._stream_to_file(r3):
+                        return True
+        except Exception:
+            pass
+        return False
+
+    # ── orchestration ─────────────────────────────────────────────────────────
 
     def download_apk(self) -> bool:
         apk_path = Path(APK_PATH)
@@ -123,142 +289,65 @@ class APKInstaller:
             log_and_broadcast("APK bereits vorhanden.")
             return True
 
-        sources = [
+        self.status = "downloading"
+        for name, fn in [
             ("APKPure",  self._dl_apkpure),
             ("Uptodown", self._dl_uptodown),
             ("APKCombo", self._dl_apkcombo),
-        ]
-        for name, fn in sources:
+            ("APKMonk",  self._dl_apkmonk),
+        ]:
             log_and_broadcast(f"APK Download: versuche {name} ...")
             try:
                 if fn():
-                    size = apk_path.stat().st_size
-                    log_and_broadcast(f"APK heruntergeladen von {name}: {size // 1024} KB")
+                    size = Path(APK_PATH).stat().st_size
+                    log_and_broadcast(f"APK von {name} heruntergeladen: {size // 1024} KB")
                     return True
             except Exception as e:
                 log_and_broadcast(f"{name} fehlgeschlagen: {e}")
-        log_and_broadcast("APK Download fehlgeschlagen. Bitte /apk/handyparken.apk manuell ablegen.")
-        return False
 
-    def _stream_to_file(self, resp: requests.Response) -> bool:
-        ct = resp.headers.get("Content-Type", "")
-        if "html" in ct.lower():
-            return False
-        total = 0
-        with open(APK_PATH, "wb") as f:
-            for chunk in resp.iter_content(1 << 16):
-                f.write(chunk)
-                total += len(chunk)
-        if total < 1_000_000:
-            Path(APK_PATH).unlink(missing_ok=True)
-            return False
-        return True
-
-    @staticmethod
-    def _fetch(session: requests.Session, url: str, referer: str = "", stream: bool = False) -> requests.Response:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        }
-        if referer:
-            headers["Referer"] = referer
-        return session.get(url, headers=headers, timeout=120,
-                           stream=stream, allow_redirects=True)
-
-    def _dl_apkpure(self) -> bool:
-        from lxml import html as lxhtml
-        s = requests.Session()
-        base = "https://apkpure.com"
-        app_url = f"{base}/handyparken/{PACKAGE}"
-        dl_url = f"{app_url}/download"
-        self._fetch(s, app_url)  # seed cookies
-        r = self._fetch(s, dl_url, referer=app_url)
-        r.raise_for_status()
-        tree = lxhtml.fromstring(r.content)
-        candidates = (
-            tree.xpath('//*[@id="download_link"]/@href') +
-            tree.xpath('//a[contains(@class,"download-start")]/@href') +
-            tree.xpath('//a[contains(@href,"d.apkpure.com")]/@href') +
-            tree.xpath('//a[contains(@href,".apk")]/@href')
-        )
-        for href in candidates:
-            if href.startswith("/"):
-                href = base + href
-            if not href.startswith("http"):
-                continue
-            r2 = self._fetch(s, href, referer=dl_url, stream=True)
-            if self._stream_to_file(r2):
-                return True
-        # Direct URL fallback with proper Referer
-        direct = f"https://d.apkpure.com/b/APK/{PACKAGE}?version=latest"
-        r3 = self._fetch(s, direct, referer=dl_url, stream=True)
-        return self._stream_to_file(r3)
-
-    def _dl_uptodown(self) -> bool:
-        from lxml import html as lxhtml
-        s = requests.Session()
-        base = "https://handyparken.at.uptodown.com"
-        r = self._fetch(s, f"{base}/android")
-        r.raise_for_status()
-        tree = lxhtml.fromstring(r.content)
-        for href in (tree.xpath('//a[@id="detail-download-button"]/@href') +
-                     tree.xpath('//a[contains(@href,".apk")]/@href')):
-            if href.startswith("/"):
-                href = base + href
-            r2 = self._fetch(s, href, referer=base, stream=True)
-            if self._stream_to_file(r2):
-                return True
-        return False
-
-    def _dl_apkcombo(self) -> bool:
-        from lxml import html as lxhtml
-        s = requests.Session()
-        base = "https://apkcombo.com"
-        page = f"{base}/handyparken/{PACKAGE}/download/apk"
-        r = self._fetch(s, page)
-        r.raise_for_status()
-        tree = lxhtml.fromstring(r.content)
-        for href in (tree.xpath('//a[contains(@class,"variant")]/@href') +
-                     tree.xpath('//a[contains(@href,".apk")]/@href') +
-                     tree.xpath('//a[contains(@class,"download")]/@href')):
-            if href.startswith("/"):
-                href = base + href
-            if not href.startswith("http"):
-                continue
-            r2 = self._fetch(s, href, referer=page, stream=True)
-            if self._stream_to_file(r2):
-                return True
+        log_and_broadcast("Alle Download-Quellen fehlgeschlagen.")
         return False
 
     def install(self) -> bool:
         if not Path(APK_PATH).exists():
-            log_and_broadcast(f"APK not found at {APK_PATH}")
+            log_and_broadcast(f"APK nicht unter {APK_PATH} gefunden.")
             return False
-        log_and_broadcast("Installing APK ...")
+        log_and_broadcast("Installiere HANDYPARKEN APK ...")
+        self.status = "installing"
         result = self.adb.run(["install", "-r", APK_PATH], timeout=120)
         if result and result.returncode == 0:
-            log_and_broadcast("APK installed successfully.")
+            log_and_broadcast("APK erfolgreich installiert.")
+            self.status = "installed"
             return True
-        err = result.stderr.decode(errors="replace") if result else "unknown"
-        log_and_broadcast(f"APK install failed: {err}")
+        err = result.stderr.decode(errors="replace") if result else "unbekannt"
+        log_and_broadcast(f"Installation fehlgeschlagen: {err}")
+        self.status = "failed"
         return False
 
     def ensure_installed(self) -> None:
-        log_and_broadcast("Checking if HANDYPARKEN is installed ...")
+        log_and_broadcast("Prüfe HANDYPARKEN Installation ...")
         if self.is_installed():
-            log_and_broadcast("HANDYPARKEN already installed.")
+            log_and_broadcast("HANDYPARKEN bereits installiert.")
+            self.status = "installed"
             return
-        log_and_broadcast("HANDYPARKEN not found — downloading ...")
+
+        log_and_broadcast("HANDYPARKEN nicht gefunden — starte Download ...")
         if not self.download_apk():
-            log_and_broadcast("Using fallback: no APK available. Place APK in /apk/handyparken.apk and restart.")
+            self.status = "failed"
+            log_and_broadcast("Kein APK verfügbar. Bitte /apk/handyparken.apk manuell ablegen.")
             return
+
         for attempt in range(3):
             if self.install():
                 return
-            log_and_broadcast(f"Install attempt {attempt + 1} failed. Retrying ...")
+            log_and_broadcast(f"Installationsversuch {attempt + 1} fehlgeschlagen. Wiederhole ...")
             time.sleep(3)
-        log_and_broadcast("All install attempts failed.")
 
+        self.status = "failed"
+        log_and_broadcast("Alle Installationsversuche fehlgeschlagen.")
+
+
+# ── Bot Controller ────────────────────────────────────────────────────────────
 
 class BotController:
     def __init__(self, adb: ADBManager) -> None:
@@ -276,23 +365,33 @@ class BotController:
         self.running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
-        log_and_broadcast(f"Bot started for Kennzeichen: {self.license_plate}")
+        log_and_broadcast(f"Bot gestartet für Kennzeichen: {self.license_plate}")
 
     def stop(self) -> None:
         self.running = False
         self._stop_event.set()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
-        log_and_broadcast("Bot stopped.")
+        log_and_broadcast("Bot gestoppt.")
 
     def _loop(self) -> None:
         while self.running and not self._stop_event.is_set():
             try:
+                if not apk_installer.is_installed():
+                    status = apk_installer.status
+                    if status == "failed":
+                        log_and_broadcast("HANDYPARKEN nicht installiert (fehlgeschlagen). Bot pausiert.")
+                        self._stop_event.wait(timeout=60)
+                    else:
+                        log_and_broadcast(f"Warte auf App-Installation (Status: {status}) ...")
+                        self._stop_event.wait(timeout=15)
+                    continue
+
                 self._start_app()
                 time.sleep(3)
                 self._dump_and_tap()
             except Exception as e:
-                log_and_broadcast(f"Bot loop error: {e}")
+                log_and_broadcast(f"Bot Fehler: {e}")
             self._stop_event.wait(timeout=60)
 
     def _start_app(self) -> None:
@@ -332,6 +431,7 @@ class BotController:
         return x, y
 
     def _dump_and_tap(self) -> None:
+        from lxml import etree
         log_and_broadcast(f"Suche Kennzeichen: {self.license_plate} ...")
         deadline = time.time() + 30
         while time.time() < deadline and self.running:
@@ -367,21 +467,23 @@ class BotController:
         log_and_broadcast(f"Timeout: Kennzeichen {self.license_plate} nicht gefunden.")
 
 
+# ── Globals & Startup ─────────────────────────────────────────────────────────
+
 adb_manager = ADBManager()
 apk_installer = APKInstaller(adb_manager)
 bot_controller = BotController(adb_manager)
 
 
 def _wait_for_emulator_and_install() -> None:
-    """Retry ADB connection until the emulator is ready, then install APK."""
-    log_and_broadcast("Warte auf Android-Emulator (kann 2-5 Minuten dauern) ...")
+    log_and_broadcast("Warte auf Android-Emulator (kann 2–5 Minuten dauern) ...")
     for attempt in range(60):
         if adb_manager.connect():
             apk_installer.ensure_installed()
             return
         log_and_broadcast(f"Emulator noch nicht bereit, warte ... ({attempt + 1}/60)")
         time.sleep(10)
-    log_and_broadcast("Emulator nicht erreichbar nach 10 Minuten. Bitte manuell prüfen.")
+    log_and_broadcast("Emulator nicht erreichbar nach 10 Minuten.")
+    apk_installer.status = "failed"
 
 
 @asynccontextmanager
@@ -394,6 +496,8 @@ async def lifespan(app: FastAPI):
     bot_controller.stop()
 
 
+# ── API ───────────────────────────────────────────────────────────────────────
+
 app = FastAPI(title="ParkBot", lifespan=lifespan)
 
 
@@ -402,14 +506,17 @@ async def index():
     try:
         return HTMLResponse(content=Path(FRONTEND_PATH).read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return HTMLResponse(content="<h1>Frontend not found. Mount frontend/ volume.</h1>", status_code=404)
+        return HTMLResponse(
+            content="<h1>Frontend nicht gefunden. Volume ./frontend mounten.</h1>",
+            status_code=404
+        )
 
 
 @app.post("/start")
 async def start_bot(body: dict):
     plate = body.get("license_plate", "").strip()
     if not plate:
-        return {"error": "license_plate required"}
+        return {"error": "license_plate erforderlich"}
     bot_controller.start(plate)
     return {"status": "started", "license_plate": plate}
 
@@ -421,15 +528,21 @@ async def stop_bot():
 
 
 @app.get("/status")
-async def status():
-    return {"running": bot_controller.running}
+async def get_status():
+    return {
+        "running": bot_controller.running,
+        "license_plate": bot_controller.license_plate,
+        "apk_status": apk_installer.status,
+    }
 
 
 @app.get("/health")
 async def health():
-    emulator_status = "connected" if adb_manager.is_connected() else "disconnected"
-    bot_status = "running" if bot_controller.running else "stopped"
-    return {"emulator": emulator_status, "bot": bot_status}
+    return {
+        "emulator": "connected" if adb_manager.is_connected() else "disconnected",
+        "bot": "running" if bot_controller.running else "stopped",
+        "apk": apk_installer.status,
+    }
 
 
 async def _mjpeg_generator():
@@ -456,7 +569,7 @@ async def video_feed():
 async def ws_logs(websocket: WebSocket):
     await websocket.accept()
     connected_clients.add(websocket)
-    await websocket.send_text("WebSocket verbunden — Logs erscheinen hier.")
+    await websocket.send_text(f"WebSocket verbunden — APK Status: {apk_installer.status}")
     try:
         while True:
             await websocket.receive_text()
