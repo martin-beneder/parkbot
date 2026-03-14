@@ -20,7 +20,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 logger = logging.getLogger(__name__)
 
 PACKAGE = "at.mobilkom.android.handyparken"
-BOOKING_INTERVAL_SEC = int(os.environ.get("BOOKING_INTERVAL", "840"))  # 14 min default
+DEFAULT_DURATION_MIN  = int(os.environ.get("BOOKING_DURATION", "15"))  # parking ticket duration
+DEFAULT_PAUSE_MIN     = int(os.environ.get("BOOKING_PAUSE",    "14"))  # minutes between bookings
 APK_PATH = "/apk/handyparken.apk"
 FRONTEND_PATH = "/frontend/index.html"
 ADB_HOST = os.environ.get("ADB_HOST", "emulator")
@@ -381,18 +382,26 @@ class BotController:
         self.adb = adb
         self.running = False
         self.license_plate: str = ""
+        self.duration_min: int = DEFAULT_DURATION_MIN
+        self.pause_sec: int = DEFAULT_PAUSE_MIN * 60
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
 
-    def start(self, license_plate: str) -> None:
+    def start(self, license_plate: str, duration_min: int = DEFAULT_DURATION_MIN,
+              pause_min: int = DEFAULT_PAUSE_MIN) -> None:
         if self.running:
             self.stop()
         self.license_plate = license_plate.upper().strip()
+        self.duration_min  = max(15, duration_min)
+        self.pause_sec     = max(1, pause_min) * 60
         self._stop_event.clear()
         self.running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
-        log_and_broadcast(f"Bot gestartet für Kennzeichen: {self.license_plate}")
+        log_and_broadcast(
+            f"Bot gestartet — Kennzeichen: {self.license_plate}, "
+            f"Dauer: {self.duration_min} Min., Pause: {pause_min} Min."
+        )
 
     def stop(self) -> None:
         self.running = False
@@ -417,9 +426,9 @@ class BotController:
                 time.sleep(3)
                 success = self._run_cycle()
                 if success:
-                    mins = BOOKING_INTERVAL_SEC // 60
+                    mins = self.pause_sec // 60
                     log_and_broadcast(f"Nächste Buchung in {mins} Minuten.")
-                    self._stop_event.wait(timeout=BOOKING_INTERVAL_SEC)
+                    self._stop_event.wait(timeout=self.pause_sec)
                 else:
                     log_and_broadcast("Buchung fehlgeschlagen. Neuer Versuch in 60 Sek. ...")
                     self._stop_event.wait(timeout=60)
@@ -758,6 +767,59 @@ class BotController:
         time.sleep(1.5)
         return True
 
+    def _select_duration(self, root) -> None:
+        """Adjust the parking duration on the booking screen using prev/next arrows."""
+        val_node = root.xpath(f'//node[@resource-id="{PACKAGE}:id/pboi_value"]')
+        if not val_node:
+            return
+        try:
+            current = int(val_node[0].get("text", "0"))
+        except ValueError:
+            return
+        target = self.duration_min
+        if current == target:
+            return
+
+        # Determine which button to tap
+        if current < target:
+            btn_id = f"{PACKAGE}:id/ticket_order_parking_duration_next"
+            direction = "vor"
+        else:
+            btn_id = f"{PACKAGE}:id/ticket_order_parking_duration_prev"
+            direction = "zurück"
+
+        btn = root.xpath(f'//node[@resource-id="{btn_id}"]')
+        if not btn:
+            log_and_broadcast(f"Dauer-Pfeiltaste nicht gefunden (Ziel: {target} Min.)")
+            return
+
+        c = self._parse_bounds(btn[0].get("bounds", ""))
+        if not c:
+            return
+
+        log_and_broadcast(f"Stelle Parkdauer ein: {current} → {target} Min.")
+        steps = 0
+        while current != target and steps < 20:
+            self.adb.run(["shell", "input", "tap", str(c[0]), str(c[1])])
+            time.sleep(0.4)
+            # Re-read current value
+            xml = self._dump_ui()
+            if not xml:
+                break
+            r2 = self._parse_ui(xml)
+            if r2 is None:
+                break
+            v2 = r2.xpath(f'//node[@resource-id="{PACKAGE}:id/pboi_value"]')
+            if not v2:
+                break
+            try:
+                current = int(v2[0].get("text", "0"))
+            except ValueError:
+                break
+            steps += 1
+
+        log_and_broadcast(f"Parkdauer gesetzt: {current} Min.")
+
     def _tap_buchen(self, root) -> bool:
         btn = root.xpath(f'//node[@resource-id="{PACKAGE}:id/btn_order_ticket" and @enabled="true"]')
         if not btn:
@@ -861,6 +923,13 @@ class BotController:
             # ── Booking screen ─────────────────────────────────────────────────
             if self._is_booking_screen(root):
                 if plate_selection_done or self._is_plate_selected(root):
+                    self._select_duration(root)
+                    # Re-dump after duration changes to get fresh root for BUCHEN
+                    xml2 = self._dump_ui()
+                    if xml2:
+                        root2 = self._parse_ui(xml2)
+                        if root2 is not None:
+                            root = root2
                     self._tap_buchen(root)
                     time.sleep(3)
                 elif plate_form_submitted:
@@ -935,8 +1004,14 @@ async def start_bot(body: dict):
     plate = body.get("license_plate", "").strip()
     if not plate:
         return {"error": "license_plate erforderlich"}
-    bot_controller.start(plate)
-    return {"status": "started", "license_plate": plate}
+    try:
+        duration_min = int(body.get("duration_min", DEFAULT_DURATION_MIN))
+        pause_min    = int(body.get("pause_min",    DEFAULT_PAUSE_MIN))
+    except (ValueError, TypeError):
+        return {"error": "duration_min und pause_min müssen ganzzahlig sein"}
+    bot_controller.start(plate, duration_min=duration_min, pause_min=pause_min)
+    return {"status": "started", "license_plate": plate,
+            "duration_min": duration_min, "pause_min": pause_min}
 
 
 @app.post("/stop")
@@ -948,9 +1023,11 @@ async def stop_bot():
 @app.get("/status")
 async def get_status():
     return {
-        "running": bot_controller.running,
+        "running":       bot_controller.running,
         "license_plate": bot_controller.license_plate,
-        "apk_status": apk_installer.status,
+        "duration_min":  bot_controller.duration_min,
+        "pause_min":     bot_controller.pause_sec // 60,
+        "apk_status":    apk_installer.status,
     }
 
 

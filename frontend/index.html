@@ -68,6 +68,26 @@
             <input type="text" id="plate-input" class="form-control bg-dark text-white border-secondary"
                    placeholder="z.B. W123AB" maxlength="10" style="text-transform:uppercase;">
           </div>
+          <div class="row g-2 mb-3">
+            <div class="col-6">
+              <label class="form-label">Parkdauer</label>
+              <select id="duration-select" class="form-select bg-dark text-white border-secondary">
+                <option value="15">15 Min.</option>
+                <option value="30">30 Min.</option>
+                <option value="45">45 Min.</option>
+                <option value="60">60 Min.</option>
+                <option value="75">75 Min.</option>
+                <option value="90">90 Min.</option>
+                <option value="105">105 Min.</option>
+                <option value="120">120 Min.</option>
+              </select>
+            </div>
+            <div class="col-6">
+              <label class="form-label">Pause (Min.)</label>
+              <input type="number" id="pause-input" class="form-control bg-dark text-white border-secondary"
+                     value="14" min="1" max="240">
+            </div>
+          </div>
           <div class="d-grid gap-2">
             <button class="btn btn-start" id="btn-start" onclick="startBot()" disabled>
               &#9654; Start
@@ -283,14 +303,17 @@
   // ── Controls ──────────────────────────────────────────────────────────────
 
   async function startBot() {
-    const plate = document.getElementById('plate-input').value.trim().toUpperCase();
+    const plate       = document.getElementById('plate-input').value.trim().toUpperCase();
+    const durationMin = parseInt(document.getElementById('duration-select').value, 10);
+    const pauseMin    = parseInt(document.getElementById('pause-input').value, 10);
     if (!plate) { addLog('Bitte Kennzeichen eingeben!', 'log-error'); return; }
-    addLog(`Starte Bot für ${plate} ...`);
+    if (!pauseMin || pauseMin < 1) { addLog('Bitte gültige Pause eingeben!', 'log-error'); return; }
+    addLog(`Starte Bot — ${plate}, ${durationMin} Min., Pause ${pauseMin} Min. ...`);
     try {
       const data = await fetch('/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ license_plate: plate })
+        body: JSON.stringify({ license_plate: plate, duration_min: durationMin, pause_min: pauseMin })
       }).then(r => r.json());
       if (data.error) addLog(`Fehler: ${data.error}`, 'log-error');
       else updateBotStatus(true);
