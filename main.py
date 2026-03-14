@@ -1,4 +1,5 @@
 import asyncio
+import io
 import logging
 import os
 import re
@@ -6,6 +7,7 @@ import subprocess
 import threading
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -375,6 +377,158 @@ class Credentials:
         return f"{self.login[:3]}***"
 
 
+# ── Telegram Notifier ─────────────────────────────────────────────────────────
+
+def _try_int(v) -> Optional[int]:
+    try:
+        return int(v) if v else None
+    except (ValueError, TypeError):
+        return None
+
+
+class TelegramNotifier:
+    def __init__(self) -> None:
+        self.token: str = os.environ.get("TELEGRAM_TOKEN", "")
+        self.chat_id: Optional[int] = _try_int(os.environ.get("TELEGRAM_CHAT_ID"))
+        self._app = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._thread: Optional[threading.Thread] = None
+        self._running = False
+        self._lock = threading.Lock()
+
+    def configure(self, token: str) -> dict:
+        if not re.match(r'^\d+:[A-Za-z0-9_-]{35,}$', token):
+            return {"error": "Ungültiges Token-Format."}
+        self.stop()
+        self.token = token
+        self.start()
+        return {"ok": True}
+
+    def start(self) -> None:
+        if not self.token:
+            return
+        self._thread = threading.Thread(target=self._start_polling, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=10)
+
+    def _start_polling(self) -> None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._loop = loop
+        self._running = True
+        try:
+            from telegram.ext import ApplicationBuilder, CommandHandler
+            self._app = ApplicationBuilder().token(self.token).build()
+            self._app.add_handler(CommandHandler("start", self._cmd_start))
+            self._app.add_handler(CommandHandler("buchen", self._cmd_buchen))
+            self._app.add_handler(CommandHandler("stop", self._cmd_stop_parking))
+            self._app.add_handler(CommandHandler("status", self._cmd_status))
+            loop.run_until_complete(self._run_polling())
+        except Exception as e:
+            log_and_broadcast(f"Telegram Fehler: {e}")
+        finally:
+            self._running = False
+            loop.close()
+
+    async def _run_polling(self) -> None:
+        """Run polling loop without signal handlers (safe for non-main threads)."""
+        await self._app.initialize()
+        await self._app.start()
+        await self._app.updater.start_polling(drop_pending_updates=True)
+        log_and_broadcast("Telegram Bot verbunden, warte auf /start ...")
+        while self._running:
+            await asyncio.sleep(1)
+        await self._app.updater.stop()
+        await self._app.stop()
+        await self._app.shutdown()
+
+    def _is_authorized(self, update) -> bool:
+        with self._lock:
+            return update.effective_chat.id == self.chat_id
+
+    async def _cmd_start(self, update, context) -> None:
+        uid = update.effective_chat.id
+        with self._lock:
+            if self.chat_id is None:
+                self.chat_id = uid
+                log_and_broadcast(f"Telegram: Chat {uid} autorisiert.")
+                await update.message.reply_text(
+                    "✅ Autorisiert!\n\nBefehle:\n"
+                    "/buchen <Kennzeichen> [Dauer] [Pause]\n"
+                    "/stop – Bot stoppen\n/status – Status"
+                )
+                return
+            if uid != self.chat_id:
+                await update.message.reply_text("⛔ Nicht autorisiert.")
+                return
+        await update.message.reply_text("Bereits autorisiert. Nutze /buchen <Kennzeichen>.")
+
+    async def _cmd_buchen(self, update, context) -> None:
+        if not self._is_authorized(update):
+            await update.message.reply_text("⛔ Nicht autorisiert.")
+            return
+        args = context.args
+        if not args:
+            await update.message.reply_text("Verwendung: /buchen <Kennzeichen> [Dauer_min] [Pause_min]")
+            return
+        plate = args[0].upper()
+        duration = int(args[1]) if len(args) > 1 else bot_controller.duration_min
+        pause = int(args[2]) if len(args) > 2 else bot_controller.pause_sec // 60
+        bot_controller.start(plate, duration_min=duration, pause_min=pause)
+        await update.message.reply_text(
+            f"🚗 Bot gestartet für {plate} ({duration} Min., Pause {pause} Min.)"
+        )
+
+    async def _cmd_stop_parking(self, update, context) -> None:
+        if not self._is_authorized(update):
+            await update.message.reply_text("⛔ Nicht autorisiert.")
+            return
+        bot_controller.stop()
+        await update.message.reply_text("🛑 Bot gestoppt.")
+
+    async def _cmd_status(self, update, context) -> None:
+        if not self._is_authorized(update):
+            await update.message.reply_text("⛔ Nicht autorisiert.")
+            return
+        state = "läuft" if bot_controller.running else "gestoppt"
+        plate = bot_controller.license_plate or "–"
+        dur   = bot_controller.duration_min
+        pause = bot_controller.pause_sec // 60
+        await update.message.reply_text(
+            f"Status: {state}\nKennzeichen: {plate}\nDauer: {dur} Min.\nPause: {pause} Min."
+        )
+
+    def notify_booking_success(self, png_bytes: bytes, plate: str, duration_min: int,
+                               ticket_no: Optional[str] = None) -> None:
+        with self._lock:
+            chat_id = self.chat_id
+        if not chat_id or not self._loop or not self._loop.is_running():
+            return
+        now = datetime.now()
+        until = now + timedelta(minutes=duration_min)
+        caption = (
+            f"🅿️ Parkschein gebucht!\n"
+            f"Kennzeichen: {plate}\n"
+            + (f"Parkschein-Nr.: {ticket_no}\n" if ticket_no else "")
+            + f"Gültig: {now.strftime('%H:%M')} – {until.strftime('%H:%M')} Uhr\n"
+            f"({duration_min} Minuten)"
+        )
+
+        async def _send():
+            try:
+                bio = io.BytesIO(png_bytes)
+                bio.name = "parkschein.png"
+                await self._app.bot.send_photo(chat_id=chat_id, photo=bio, caption=caption)
+            except Exception as e:
+                log_and_broadcast(f"Telegram Sendefehler: {e}")
+
+        asyncio.run_coroutine_threadsafe(_send(), self._loop)
+
+
 # ── Bot Controller ─────────────────────────────────────────────────────────────
 
 class BotController:
@@ -424,8 +578,11 @@ class BotController:
 
                 self._start_app()
                 time.sleep(3)
-                success = self._run_cycle()
+                success, receipt_png, ticket_no = self._run_cycle()
                 if success:
+                    png = receipt_png or self.adb.screencap()
+                    if png:
+                        telegram_notifier.notify_booking_success(png, self.license_plate, self.duration_min, ticket_no)
                     mins = self.pause_sec // 60
                     log_and_broadcast(f"Nächste Buchung in {mins} Minuten.")
                     self._stop_event.wait(timeout=self.pause_sec)
@@ -822,6 +979,23 @@ class BotController:
 
         log_and_broadcast(f"Parkdauer gesetzt: {current} Min.")
 
+    def _extract_ticket_number(self, root) -> Optional[str]:
+        """Try to extract the parking ticket / order number from the receipt screen XML."""
+        # Try known resource-id fragments first
+        for fragment in ["ticket_id", "order_id", "schein_nr", "booking_id",
+                         "ticket_number", "order_number", "receipt_number",
+                         "auftrag", "nummer", "beleg"]:
+            for n in root.xpath(f'//node[contains(@resource-id,"{fragment}")]'):
+                t = (n.get("text") or "").strip()
+                if re.match(r'^\d{4,}$', t):
+                    return t
+        # Fallback: any standalone numeric text (6–12 digits, not a year/phone)
+        for n in root.iter():
+            t = (n.get("text") or "").strip()
+            if re.match(r'^\d{6,12}$', t):
+                return t
+        return None
+
     def _tap_buchen(self, root) -> bool:
         btn = root.xpath(f'//node[@resource-id="{PACKAGE}:id/btn_order_ticket" and @enabled="true"]')
         if not btn:
@@ -836,8 +1010,8 @@ class BotController:
 
     # ── main cycle ────────────────────────────────────────────────────────────
 
-    def _run_cycle(self) -> bool:
-        """One full booking cycle. Returns True on successful booking."""
+    def _run_cycle(self) -> tuple[bool, Optional[bytes], Optional[str]]:
+        """One full booking cycle. Returns (success, receipt_png, ticket_number)."""
         from lxml import etree
         deadline = time.time() + 180
         login_tried = False
@@ -845,12 +1019,15 @@ class BotController:
         plate_form_submitted = False  # True after SPEICHERN was tapped in add form
         picker_tried = False          # True after picker was opened at least once
         booking_submitted = False     # True after BUCHUNG BESTÄTIGEN was tapped
+        receipt_png: Optional[bytes] = None
+        receipt_ticket: Optional[str] = None
+        receipt_captured = False
 
         while time.time() < deadline and self.running:
             xml = self._dump_ui()
             if xml is None:
                 log_and_broadcast("UI-Dump fehlgeschlagen.")
-                return False
+                return False, None, None
 
             try:
                 root = etree.fromstring(xml.encode())
@@ -867,7 +1044,7 @@ class BotController:
             if self._is_login_screen(root):
                 if login_tried:
                     log_and_broadcast("Login fehlgeschlagen. Zugangsdaten prüfen.")
-                    return False
+                    return False, None, None
                 if self._do_login(root):
                     login_tried = True
                     log_and_broadcast("Warte auf Login-Erfolg ...")
@@ -882,13 +1059,23 @@ class BotController:
             if booking_submitted:
                 if self._is_booking_screen(root):
                     log_and_broadcast("Parkschein erfolgreich gebucht!")
-                    return True
-                # Still on confirmation screen (dialog was informational) → press BACK
+                    return True, receipt_png, receipt_ticket
+                # Still on the preview/submit screen → press BACK
                 if root.xpath(f'//node[@resource-id="{PACKAGE}:id/orderpreview_submit"]'):
                     log_and_broadcast("Buchung abgeschlossen — zurück zur Buchungsansicht ...")
                     self.adb.run(["shell", "input", "keyevent", "KEYCODE_BACK"])
                     time.sleep(1.5)
                     continue
+                # Receipt / success screen — capture it once, then navigate back
+                if not receipt_captured:
+                    receipt_png = self.adb.screencap()
+                    receipt_ticket = self._extract_ticket_number(root)
+                    receipt_captured = True
+                    if receipt_ticket:
+                        log_and_broadcast(f"Parkschein-Nummer: {receipt_ticket}")
+                self.adb.run(["shell", "input", "keyevent", "KEYCODE_BACK"])
+                time.sleep(1.5)
+                continue
 
             # ── Booking confirmation screen ("Buchung bestätigen") ────────────
             if not booking_submitted:
@@ -953,15 +1140,16 @@ class BotController:
             time.sleep(2)
 
         log_and_broadcast("Buchungs-Timeout überschritten.")
-        return False
+        return False, None, None
 
 
 # ── Globals & Startup ─────────────────────────────────────────────────────────
 
-adb_manager   = ADBManager()
-apk_installer = APKInstaller(adb_manager)
-bot_controller = BotController(adb_manager)
-credentials   = Credentials()
+adb_manager       = ADBManager()
+apk_installer     = APKInstaller(adb_manager)
+bot_controller    = BotController(adb_manager)
+credentials       = Credentials()
+telegram_notifier = TelegramNotifier()
 
 
 def _wait_for_emulator_and_install() -> None:
@@ -982,8 +1170,11 @@ async def lifespan(app: FastAPI):
     _main_loop = asyncio.get_event_loop()
     log_and_broadcast("ParkBot startet ...")
     threading.Thread(target=_wait_for_emulator_and_install, daemon=True).start()
+    if telegram_notifier.token:
+        telegram_notifier.start()
     yield
     bot_controller.stop()
+    telegram_notifier.stop()
 
 
 # ── API ───────────────────────────────────────────────────────────────────────
@@ -1049,6 +1240,21 @@ async def set_credentials(body: dict):
 @app.get("/credentials")
 async def get_credentials():
     return {"set": credentials.is_set, "login": credentials.display if credentials.is_set else None}
+
+
+@app.post("/telegram/setup")
+async def telegram_setup(body: dict):
+    token = body.get("token", "").strip()
+    return telegram_notifier.configure(token)
+
+
+@app.get("/telegram/status")
+async def telegram_status():
+    return {
+        "token_set": bool(telegram_notifier.token),
+        "connected": telegram_notifier._running,
+        "chat_id": telegram_notifier.chat_id,
+    }
 
 
 @app.get("/health")

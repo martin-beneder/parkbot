@@ -19,6 +19,8 @@ services:
       - ADB_PORT=5555
       - HP_LOGIN=${HP_LOGIN:-}
       - HP_PASSWORD=${HP_PASSWORD:-}
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
     volumes:
       - ./apk:/apk
       - ./frontend:/frontend

@@ -6,3 +6,4 @@ opencv-python-headless
 websockets
 requests
 numpy
+python-telegram-bot>=20.0,<22.0
