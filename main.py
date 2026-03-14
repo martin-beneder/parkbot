@@ -349,6 +349,32 @@ class APKInstaller:
 
 # ── Bot Controller ────────────────────────────────────────────────────────────
 
+# ── Credentials ───────────────────────────────────────────────────────────────
+
+class Credentials:
+    """Holds login credentials in memory. Pre-loaded from env vars."""
+
+    def __init__(self) -> None:
+        self.login: str = os.environ.get("HP_LOGIN", "")
+        self.password: str = os.environ.get("HP_PASSWORD", "")
+
+    @property
+    def is_set(self) -> bool:
+        return bool(self.login and self.password)
+
+    @property
+    def display(self) -> str:
+        """Masked version safe to show in UI."""
+        if not self.login:
+            return "(nicht gesetzt)"
+        if "@" in self.login:
+            user, domain = self.login.split("@", 1)
+            return f"{user[:2]}***@{domain}"
+        return f"{self.login[:3]}***"
+
+
+# ── Bot Controller ─────────────────────────────────────────────────────────────
+
 class BotController:
     def __init__(self, adb: ADBManager) -> None:
         self.adb = adb
@@ -374,28 +400,28 @@ class BotController:
             self._thread.join(timeout=5)
         log_and_broadcast("Bot gestoppt.")
 
+    # ── main loop ─────────────────────────────────────────────────────────────
+
     def _loop(self) -> None:
         while self.running and not self._stop_event.is_set():
             try:
                 if not apk_installer.is_installed():
-                    status = apk_installer.status
-                    if status == "failed":
-                        log_and_broadcast("HANDYPARKEN nicht installiert (fehlgeschlagen). Bot pausiert.")
-                        self._stop_event.wait(timeout=60)
-                    else:
-                        log_and_broadcast(f"Warte auf App-Installation (Status: {status}) ...")
-                        self._stop_event.wait(timeout=15)
+                    st = apk_installer.status
+                    wait = 60 if st == "failed" else 15
+                    log_and_broadcast(f"Warte auf App-Installation (Status: {st}) ...")
+                    self._stop_event.wait(timeout=wait)
                     continue
 
                 self._start_app()
                 time.sleep(3)
-                self._dump_and_tap()
+                self._run_cycle()
             except Exception as e:
                 log_and_broadcast(f"Bot Fehler: {e}")
             self._stop_event.wait(timeout=60)
 
+    # ── app launch ────────────────────────────────────────────────────────────
+
     def _resolve_activity(self) -> Optional[str]:
-        """Return the component name (pkg/activity) to launch, or None."""
         result = self.adb.run(
             ["shell", "cmd", "package", "resolve-activity", "--brief", PACKAGE], timeout=10
         )
@@ -409,33 +435,29 @@ class BotController:
 
     def _start_app(self) -> None:
         log_and_broadcast("Starte HANDYPARKEN App ...")
-
-        # Resolve the real launch activity dynamically (monkey fails on this app)
         component = self._resolve_activity()
         if component:
-            result = self.adb.run(["shell", "am", "start", "-n", component])
-            if result and result.returncode == 0:
+            r = self.adb.run(["shell", "am", "start", "-n", component])
+            if r and r.returncode == 0:
                 log_and_broadcast("App gestartet.")
                 return
-
-        # Fallback: monkey
-        result = self.adb.run(["shell", "monkey", "-p", PACKAGE, "1"])
-        if result and result.returncode == 0:
+        r = self.adb.run(["shell", "monkey", "-p", PACKAGE, "1"])
+        if r and r.returncode == 0:
             log_and_broadcast("App gestartet (monkey).")
         else:
             log_and_broadcast("App-Start fehlgeschlagen.")
 
+    # ── UI dump ───────────────────────────────────────────────────────────────
+
     def _dump_ui(self) -> Optional[str]:
         for attempt in range(3):
-            log_and_broadcast(f"UI-Dump erstellen (Versuch {attempt + 1}) ...")
-            result = self.adb.run(["shell", "uiautomator", "dump", "/sdcard/view.xml"])
-            if result is None or result.returncode != 0:
-                log_and_broadcast("uiautomator dump fehlgeschlagen, retry ...")
+            log_and_broadcast(f"UI-Dump (Versuch {attempt + 1}) ...")
+            r = self.adb.run(["shell", "uiautomator", "dump", "/sdcard/view.xml"])
+            if r is None or r.returncode != 0:
                 time.sleep(2)
                 continue
             pull = self.adb.run(["pull", "/sdcard/view.xml", "/tmp/view.xml"])
             if pull is None or pull.returncode != 0:
-                log_and_broadcast("adb pull fehlgeschlagen, retry ...")
                 time.sleep(2)
                 continue
             try:
@@ -449,52 +471,170 @@ class BotController:
         m = re.match(r'\[(\d+),(\d+)\]\[(\d+),(\d+)\]', bounds_str)
         if not m:
             return None
-        x = (int(m.group(1)) + int(m.group(3))) // 2
-        y = (int(m.group(2)) + int(m.group(4))) // 2
-        return x, y
+        return (int(m.group(1)) + int(m.group(3))) // 2, (int(m.group(2)) + int(m.group(4))) // 2
 
-    def _dump_and_tap(self) -> None:
-        from lxml import etree
-        log_and_broadcast(f"Suche Kennzeichen: {self.license_plate} ...")
-        deadline = time.time() + 30
-        while time.time() < deadline and self.running:
-            xml_content = self._dump_ui()
-            if xml_content is None:
-                log_and_broadcast("Timeout: XML konnte nicht geladen werden.")
-                return
+    # ── text input helpers ────────────────────────────────────────────────────
+
+    def _type_text(self, text: str) -> None:
+        """Type text into the currently focused field.
+
+        Wraps text in single quotes for the Android shell so that special
+        characters like $, !, &, | are treated literally.
+        Spaces are encoded as %s (ADB input text convention).
+        Single quotes inside the text are shell-escaped with '\\'' .
+        """
+        encoded = text.replace("'", "'\\''").replace(" ", "%s")
+        self.adb.run(["shell", "input", "text", f"'{encoded}'"])
+
+    def _clear_and_type(self, x: int, y: int, text: str) -> None:
+        """Tap a field, clear any existing content, then type text."""
+        self.adb.run(["shell", "input", "tap", str(x), str(y)])
+        time.sleep(0.4)
+        # Move cursor to end, then delete backwards (handles any field length)
+        self.adb.run(["shell", "input", "keyevent", "KEYCODE_MOVE_END"])
+        time.sleep(0.1)
+        self.adb.run(["shell", "input", "keyevent"] + ["KEYCODE_DEL"] * 200)
+        time.sleep(0.2)
+        self._type_text(text)
+        time.sleep(0.3)
+
+    # ── login detection & automation ──────────────────────────────────────────
+
+    _LOGIN_IDS = {
+        "at.mobilkom.android.handyparken:id/etEmail",
+        "at.mobilkom.android.handyparken:id/btnLogin",
+    }
+
+    def _is_login_screen(self, root) -> bool:
+        for node in root.iter():
+            if node.get("resource-id") in self._LOGIN_IDS:
+                return True
+            if node.get("text") == "HANDYPARKEN LOGIN":
+                return True
+        return False
+
+    def _do_login(self, root) -> bool:
+        """Fill credentials and tap Login. Returns True if login was attempted."""
+        if not credentials.is_set:
+            log_and_broadcast("Login-Bildschirm erkannt — keine Zugangsdaten gespeichert.")
+            log_and_broadcast("Bitte Zugangsdaten im Dashboard eingeben.")
+            return False
+
+        log_and_broadcast(f"Auto-Login: {credentials.display} ...")
+
+        # Locate fields by their stable resource-ids
+        email_n = root.xpath('//node[@resource-id="at.mobilkom.android.handyparken:id/etEmail"]')
+        pwd_n   = root.xpath('//node[@resource-id="at.mobilkom.android.handyparken:id/etPassword"]')
+        btn_n   = root.xpath('//node[@resource-id="at.mobilkom.android.handyparken:id/btnLogin"]')
+
+        if not email_n or not pwd_n or not btn_n:
+            log_and_broadcast("Login-Felder konnten nicht lokalisiert werden.")
+            return False
+
+        email_xy = self._parse_bounds(email_n[0].get("bounds", ""))
+        pwd_xy   = self._parse_bounds(pwd_n[0].get("bounds", ""))
+        btn_xy   = self._parse_bounds(btn_n[0].get("bounds", ""))
+
+        if not all([email_xy, pwd_xy, btn_xy]):
+            log_and_broadcast("Login-Bounds ungültig.")
+            return False
+
+        log_and_broadcast("Gebe E-Mail ein ...")
+        self._clear_and_type(*email_xy, credentials.login)
+
+        log_and_broadcast("Gebe Passwort ein ...")
+        self._clear_and_type(*pwd_xy, credentials.password)
+
+        # Re-dump to check if Login button became enabled after filling fields
+        time.sleep(0.5)
+        xml2 = self._dump_ui()
+        if xml2:
+            from lxml import etree as _etree
             try:
-                root = etree.fromstring(xml_content.encode())
+                root2 = _etree.fromstring(xml2.encode())
+                btn2 = root2.xpath('//node[@resource-id="at.mobilkom.android.handyparken:id/btnLogin"]')
+                if btn2:
+                    c = self._parse_bounds(btn2[0].get("bounds", ""))
+                    if c:
+                        btn_xy = c
+                        if btn2[0].get("enabled") != "true":
+                            log_and_broadcast("Login-Button noch deaktiviert — tippe nochmals Passwort-Feld ...")
+                            self._clear_and_type(*pwd_xy, credentials.password)
+                            time.sleep(0.5)
+            except Exception:
+                pass
+
+        log_and_broadcast("Tippe Login ...")
+        self.adb.run(["shell", "input", "tap", str(btn_xy[0]), str(btn_xy[1])])
+        return True
+
+    # ── main cycle ────────────────────────────────────────────────────────────
+
+    def _run_cycle(self) -> None:
+        """One cycle: handle login if needed, then search & tap license plate."""
+        from lxml import etree
+        deadline = time.time() + 90   # enough for login + navigation + search
+        login_tried = False
+
+        while time.time() < deadline and self.running:
+            xml = self._dump_ui()
+            if xml is None:
+                log_and_broadcast("UI-Dump fehlgeschlagen.")
+                return
+
+            try:
+                root = etree.fromstring(xml.encode())
             except etree.XMLSyntaxError as e:
                 log_and_broadcast(f"XML Parsefehler: {e}")
                 time.sleep(2)
                 continue
+
+            # ── Login screen? ─────────────────────────────────────────────────
+            if self._is_login_screen(root):
+                if login_tried:
+                    log_and_broadcast("Login fehlgeschlagen (noch immer auf Login-Bildschirm). Zugangsdaten prüfen.")
+                    return
+                if self._do_login(root):
+                    login_tried = True
+                    log_and_broadcast("Warte auf Login-Erfolg ...")
+                    time.sleep(6)
+                    continue
+                else:
+                    # No credentials — wait and check again (user may set them via dashboard)
+                    self._stop_event.wait(timeout=15)
+                    continue
+
+            login_tried = False  # Successfully past login screen
+
+            # ── Search for license plate ──────────────────────────────────────
+            log_and_broadcast(f"Suche Kennzeichen: {self.license_plate} ...")
             nodes = root.xpath(f'//*[@text="{self.license_plate}"]')
             if not nodes:
                 log_and_broadcast(f"Kennzeichen {self.license_plate} nicht gefunden. Warte ...")
                 time.sleep(3)
                 continue
-            node = nodes[0]
-            bounds = node.get("bounds", "")
-            coords = self._parse_bounds(bounds)
+
+            node   = nodes[0]
+            coords = self._parse_bounds(node.get("bounds", ""))
             if coords is None:
-                log_and_broadcast(f"Ungültige Bounds: {bounds}")
+                log_and_broadcast(f"Ungültige Bounds: {node.get('bounds')}")
                 return
+
             x, y = coords
             log_and_broadcast(f"Kennzeichen gefunden bei ({x},{y}). Klicke ...")
-            tap_result = self.adb.run(["shell", "input", "tap", str(x), str(y)])
-            if tap_result and tap_result.returncode == 0:
-                log_and_broadcast("Klick erfolgreich.")
-            else:
-                log_and_broadcast("Klick fehlgeschlagen.")
+            r = self.adb.run(["shell", "input", "tap", str(x), str(y)])
+            log_and_broadcast("Klick erfolgreich." if r and r.returncode == 0 else "Klick fehlgeschlagen.")
             return
+
         log_and_broadcast(f"Timeout: Kennzeichen {self.license_plate} nicht gefunden.")
 
 
 # ── Globals & Startup ─────────────────────────────────────────────────────────
 
-adb_manager = ADBManager()
+adb_manager   = ADBManager()
 apk_installer = APKInstaller(adb_manager)
 bot_controller = BotController(adb_manager)
+credentials   = Credentials()
 
 
 def _wait_for_emulator_and_install() -> None:
@@ -557,6 +697,23 @@ async def get_status():
         "license_plate": bot_controller.license_plate,
         "apk_status": apk_installer.status,
     }
+
+
+@app.post("/credentials")
+async def set_credentials(body: dict):
+    login    = body.get("login", "").strip()
+    password = body.get("password", "").strip()
+    if not login or not password:
+        return {"error": "login und password erforderlich"}
+    credentials.login    = login
+    credentials.password = password
+    log_and_broadcast(f"Zugangsdaten gespeichert: {credentials.display}")
+    return {"ok": True, "login": credentials.display}
+
+
+@app.get("/credentials")
+async def get_credentials():
+    return {"set": credentials.is_set, "login": credentials.display if credentials.is_set else None}
 
 
 @app.get("/health")

@@ -17,6 +17,8 @@ services:
     environment:
       - ADB_HOST=emulator
       - ADB_PORT=5555
+      - HP_LOGIN=${HP_LOGIN:-}
+      - HP_PASSWORD=${HP_PASSWORD:-}
     volumes:
       - ./apk:/apk
       - ./frontend:/frontend

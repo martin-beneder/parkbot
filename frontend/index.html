@@ -46,6 +46,7 @@
     .btn-stop  { background: #e94560; border: none; font-weight: bold; }
     .btn-stop:hover { background: #c73652; }
     .apk-info { font-size: 0.75rem; color: #888; margin-top: 4px; min-height: 1.2em; }
+    .cred-status { font-size: 0.75rem; margin-top: 6px; min-height: 1.2em; }
   </style>
 </head>
 <body>
@@ -74,6 +75,24 @@
             <button class="btn btn-stop" id="btn-stop" onclick="stopBot()">&#9632; Stop</button>
           </div>
           <div class="apk-info text-center" id="apk-hint">Warte auf App-Installation ...</div>
+        </div>
+      </div>
+
+      <div class="card mb-3">
+        <div class="card-header">Zugangsdaten</div>
+        <div class="card-body">
+          <div class="mb-2">
+            <label class="form-label">E-Mail oder Telefonnummer</label>
+            <input type="text" id="cred-login" class="form-control bg-dark text-white border-secondary"
+                   placeholder="z.B. max@example.com" autocomplete="username">
+          </div>
+          <div class="mb-2">
+            <label class="form-label">Passwort</label>
+            <input type="password" id="cred-password" class="form-control bg-dark text-white border-secondary"
+                   placeholder="Passwort" autocomplete="current-password">
+          </div>
+          <button class="btn btn-sm btn-outline-light w-100" onclick="saveCredentials()">Speichern</button>
+          <div class="cred-status text-center" id="cred-status"></div>
         </div>
       </div>
 
@@ -124,6 +143,7 @@
   const healthInfo  = document.getElementById('health-info');
   const btnStart    = document.getElementById('btn-start');
   const apkHint     = document.getElementById('apk-hint');
+  const credStatus  = document.getElementById('cred-status');
 
   // ── Logging ──────────────────────────────────────────────────────────────
 
@@ -213,6 +233,53 @@
     }
   }
 
+  // ── Credentials ───────────────────────────────────────────────────────────
+
+  async function checkCredentials() {
+    try {
+      const data = await fetch('/credentials').then(r => r.json());
+      if (data.set) {
+        credStatus.textContent = `Gespeichert: ${data.login}`;
+        credStatus.style.color = '#00ff88';
+      } else {
+        credStatus.textContent = 'Keine Zugangsdaten gespeichert.';
+        credStatus.style.color = '#ffaa00';
+      }
+    } catch {
+      credStatus.textContent = 'Verbindungsfehler.';
+      credStatus.style.color = '#ff4444';
+    }
+  }
+
+  async function saveCredentials() {
+    const login    = document.getElementById('cred-login').value.trim();
+    const password = document.getElementById('cred-password').value;
+    if (!login || !password) {
+      credStatus.textContent = 'Bitte E-Mail/Tel. und Passwort eingeben.';
+      credStatus.style.color = '#ff4444';
+      return;
+    }
+    try {
+      const data = await fetch('/credentials', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ login, password })
+      }).then(r => r.json());
+      if (data.error) {
+        credStatus.textContent = `Fehler: ${data.error}`;
+        credStatus.style.color = '#ff4444';
+      } else {
+        credStatus.textContent = `Gespeichert: ${data.login}`;
+        credStatus.style.color = '#00ff88';
+        document.getElementById('cred-password').value = '';
+        addLog(`Zugangsdaten aktualisiert: ${data.login}`);
+      }
+    } catch (e) {
+      credStatus.textContent = `Fehler: ${e}`;
+      credStatus.style.color = '#ff4444';
+    }
+  }
+
   // ── Controls ──────────────────────────────────────────────────────────────
 
   async function startBot() {
@@ -243,6 +310,7 @@
   });
 
   checkHealth();
+  checkCredentials();
   setInterval(checkHealth, 5000);
 </script>
 </body>
