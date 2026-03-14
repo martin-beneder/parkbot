@@ -61,24 +61,19 @@ fi
 # ashmem is not required for Android 10+
 modprobe ashmem_linux 2>/dev/null || true
 
-# APK setup
+# APK download
 mkdir -p "${PROJECT_DIR}/apk"
 APK_FILE="${PROJECT_DIR}/apk/handyparken.apk"
 if [ -f "$APK_FILE" ] && [ "$(stat -c%s "$APK_FILE" 2>/dev/null || echo 0)" -gt 1000000 ]; then
   echo "==> APK bereits vorhanden ($(du -h "$APK_FILE" | cut -f1))."
 else
-  echo ""
-  echo "==> HANDYPARKEN APK nicht gefunden!"
-  echo "    Die APK kann nicht automatisch heruntergeladen werden."
-  echo "    Bitte manuell herunterladen und ablegen unter:"
-  echo "      ${APK_FILE}"
-  echo ""
-  echo "    Download-Quellen:"
-  echo "      - Google Play (via ADB/APK-Extractor auf eigenem Gerät)"
-  echo "      - https://apkpure.com/handyparken/at.mobilkom.android.handyparken"
-  echo ""
-  echo "    Alternativ: Der Controller installiert die App beim ersten Start"
-  echo "    automatisch, sobald die APK an obigem Pfad bereitgestellt wird."
+  echo "==> Lade HANDYPARKEN APK herunter ..."
+  APK_PATH="$APK_FILE" python3 "${PROJECT_DIR}/scripts/download_apk.py" || true
+  if [ -f "$APK_FILE" ] && [ "$(stat -c%s "$APK_FILE" 2>/dev/null || echo 0)" -gt 1000000 ]; then
+    echo "==> APK erfolgreich heruntergeladen."
+  else
+    echo "==> APK wird beim ersten Container-Start automatisch heruntergeladen."
+  fi
 fi
 
 # Build containers
