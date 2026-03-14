@@ -394,11 +394,34 @@ class BotController:
                 log_and_broadcast(f"Bot Fehler: {e}")
             self._stop_event.wait(timeout=60)
 
+    def _resolve_activity(self) -> Optional[str]:
+        """Return the component name (pkg/activity) to launch, or None."""
+        result = self.adb.run(
+            ["shell", "cmd", "package", "resolve-activity", "--brief", PACKAGE], timeout=10
+        )
+        if result is None or result.returncode != 0:
+            return None
+        for line in result.stdout.decode(errors="replace").splitlines():
+            line = line.strip()
+            if "/" in line and not line.startswith("priority"):
+                return line
+        return None
+
     def _start_app(self) -> None:
         log_and_broadcast("Starte HANDYPARKEN App ...")
+
+        # Resolve the real launch activity dynamically (monkey fails on this app)
+        component = self._resolve_activity()
+        if component:
+            result = self.adb.run(["shell", "am", "start", "-n", component])
+            if result and result.returncode == 0:
+                log_and_broadcast("App gestartet.")
+                return
+
+        # Fallback: monkey
         result = self.adb.run(["shell", "monkey", "-p", PACKAGE, "1"])
         if result and result.returncode == 0:
-            log_and_broadcast("App gestartet.")
+            log_and_broadcast("App gestartet (monkey).")
         else:
             log_and_broadcast("App-Start fehlgeschlagen.")
 
