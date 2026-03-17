@@ -477,10 +477,11 @@ class TelegramNotifier:
             return
         plate = args[0].upper()
         duration = int(args[1]) if len(args) > 1 else bot_controller.duration_min
-        pause = int(args[2]) if len(args) > 2 else bot_controller.pause_sec // 60
+        pause = int(args[2]) if len(args) > 2 else None
         bot_controller.start(plate, duration_min=duration, pause_min=pause)
+        effective_pause = pause if pause is not None else (duration + 2)
         await update.message.reply_text(
-            f"🚗 Bot gestartet für {plate} ({duration} Min., Pause {pause} Min.)"
+            f"🚗 Bot gestartet für {plate} ({duration} Min., Pause {effective_pause} Min.)"
         )
 
     async def _cmd_stop_parking(self, update, context) -> None:
@@ -503,26 +504,43 @@ class TelegramNotifier:
         )
 
     def notify_booking_success(self, png_bytes: bytes, plate: str, duration_min: int,
-                               ticket_no: Optional[str] = None) -> None:
+                               ticket_no: Optional[str] = None,
+                               start_time: Optional[str] = None,
+                               end_time: Optional[str] = None) -> None:
         with self._lock:
             chat_id = self.chat_id
         if not chat_id or not self._loop or not self._loop.is_running():
             return
-        now = datetime.now()
-        until = now + timedelta(minutes=duration_min)
+        # Use actual times from the ticket if available, otherwise calculate
+        if start_time and end_time:
+            time_str = f"{start_time} – {end_time} Uhr"
+        else:
+            now = datetime.now()
+            until = now + timedelta(minutes=duration_min)
+            time_str = f"{now.strftime('%H:%M')} – {until.strftime('%H:%M')} Uhr"
         caption = (
             f"🅿️ Parkschein gebucht!\n"
             f"Kennzeichen: {plate}\n"
             + (f"Parkschein-Nr.: {ticket_no}\n" if ticket_no else "")
-            + f"Gültig: {now.strftime('%H:%M')} – {until.strftime('%H:%M')} Uhr\n"
+            + f"Gültig: {time_str}\n"
             f"({duration_min} Minuten)"
         )
 
         async def _send():
             try:
-                bio = io.BytesIO(png_bytes)
-                bio.name = "parkschein.png"
-                await self._app.bot.send_photo(chat_id=chat_id, photo=bio, caption=caption)
+                # Compress PNG to JPEG to reduce upload size and avoid timeouts
+                import cv2
+                import numpy as np
+                arr = np.frombuffer(png_bytes, dtype=np.uint8)
+                img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if img is not None:
+                    _, jpg = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    bio = io.BytesIO(jpg.tobytes())
+                else:
+                    bio = io.BytesIO(png_bytes)
+                bio.name = "parkschein.jpg"
+                await self._app.bot.send_photo(chat_id=chat_id, photo=bio, caption=caption,
+                                               read_timeout=30, write_timeout=30)
             except Exception as e:
                 log_and_broadcast(f"Telegram Sendefehler: {e}")
 
@@ -537,24 +555,26 @@ class BotController:
         self.running = False
         self.license_plate: str = ""
         self.duration_min: int = DEFAULT_DURATION_MIN
-        self.pause_sec: int = DEFAULT_PAUSE_MIN * 60
+        self.pause_sec: int = (DEFAULT_DURATION_MIN + 2) * 60
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
 
     def start(self, license_plate: str, duration_min: int = DEFAULT_DURATION_MIN,
-              pause_min: int = DEFAULT_PAUSE_MIN) -> None:
+              pause_min: Optional[int] = None) -> None:
         if self.running:
             self.stop()
         self.license_plate = license_plate.upper().strip()
         self.duration_min  = max(15, duration_min)
-        self.pause_sec     = max(1, pause_min) * 60
+        # Default pause: duration + 2 min (mandatory gap after ticket expires)
+        effective_pause = pause_min if pause_min is not None else (self.duration_min + 2)
+        self.pause_sec     = max(1, effective_pause) * 60
         self._stop_event.clear()
         self.running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
         log_and_broadcast(
             f"Bot gestartet — Kennzeichen: {self.license_plate}, "
-            f"Dauer: {self.duration_min} Min., Pause: {pause_min} Min."
+            f"Dauer: {self.duration_min} Min., Pause: {effective_pause} Min."
         )
 
     def stop(self) -> None:
@@ -566,7 +586,15 @@ class BotController:
 
     # ── main loop ─────────────────────────────────────────────────────────────
 
+    def _force_stop_app(self) -> None:
+        """Force-stop the HANDYPARKEN app to recover from crashes."""
+        log_and_broadcast("App wird force-gestoppt ...")
+        self.adb.run(["shell", "am", "force-stop", PACKAGE])
+        time.sleep(2)
+
     def _loop(self) -> None:
+        retries = 0
+        max_retries = 3
         while self.running and not self._stop_event.is_set():
             try:
                 if not apk_installer.is_installed():
@@ -578,20 +606,35 @@ class BotController:
 
                 self._start_app()
                 time.sleep(3)
-                success, receipt_png, ticket_no = self._run_cycle()
+                success, receipt_png, ticket_no, start_time, end_time = self._run_cycle()
                 if success:
+                    retries = 0
                     png = receipt_png or self.adb.screencap()
                     if png:
-                        telegram_notifier.notify_booking_success(png, self.license_plate, self.duration_min, ticket_no)
-                    mins = self.pause_sec // 60
-                    log_and_broadcast(f"Nächste Buchung in {mins} Minuten.")
-                    self._stop_event.wait(timeout=self.pause_sec)
+                        telegram_notifier.notify_booking_success(
+                            png, self.license_plate, self.duration_min, ticket_no,
+                            start_time=start_time, end_time=end_time)
+                    # Wait until ticket expires + 2 min mandatory pause, then rebook
+                    wait_min = self.duration_min + 2
+                    wait_sec = wait_min * 60
+                    log_and_broadcast(f"Nächste Buchung in {wait_min} Minuten (Ablauf + 2 Min. Pause).")
+                    self._stop_event.wait(timeout=wait_sec)
                 else:
-                    log_and_broadcast("Buchung fehlgeschlagen. Neuer Versuch in 60 Sek. ...")
-                    self._stop_event.wait(timeout=60)
+                    retries += 1
+                    self._force_stop_app()
+                    if retries <= max_retries:
+                        wait = 10 * retries
+                        log_and_broadcast(f"Buchung fehlgeschlagen (Versuch {retries}/{max_retries}). Neustart in {wait} Sek. ...")
+                        self._stop_event.wait(timeout=wait)
+                    else:
+                        log_and_broadcast("Buchung fehlgeschlagen nach mehreren Versuchen. Neuer Versuch in 60 Sek. ...")
+                        retries = 0
+                        self._stop_event.wait(timeout=60)
             except Exception as e:
                 log_and_broadcast(f"Bot Fehler: {e}")
-                self._stop_event.wait(timeout=60)
+                self._force_stop_app()
+                retries += 1
+                self._stop_event.wait(timeout=15)
 
     # ── app launch ────────────────────────────────────────────────────────────
 
@@ -861,7 +904,7 @@ class BotController:
             c = self._parse_bounds(empty[0].get("bounds", ""))
             if c:
                 log_and_broadcast("Kennzeichen-Liste leer — öffne Hinzufügen-Formular ...")
-                self.adb.run(["shell", "input", "tap", str(c[0] + 360), str(c[1] + 50)])
+                self.adb.run(["shell", "input", "tap", str(c[0]), str(c[1])])
                 time.sleep(1.5)
                 return True
 
@@ -996,6 +1039,117 @@ class BotController:
                 return t
         return None
 
+    def _extract_ticket_times(self, root) -> tuple[Optional[str], Optional[str]]:
+        """Extract start and end times from the ticket detail screen.
+        Looks for patterns like 'von 16:41' and 'bis 16:56'.
+        Text may contain newlines or be split across nodes."""
+        start_time = None
+        end_time = None
+        # Collect all text from the screen for combined searching
+        all_texts = []
+        for n in root.iter():
+            text = (n.get("text") or "").strip()
+            if not text:
+                continue
+            all_texts.append(text)
+            # Match "von HH:MM" (with possible newlines/spaces)
+            m = re.search(r'von[\s\n]+(\d{1,2}:\d{2})', text)
+            if m and not start_time:
+                start_time = m.group(1)
+            # Match "bis HH:MM"
+            m = re.search(r'bis[\s\n]+(\d{1,2}:\d{2})', text)
+            if m and not end_time:
+                end_time = m.group(1)
+        # Fallback: search combined text
+        if not start_time or not end_time:
+            combined = " ".join(all_texts)
+            if not start_time:
+                m = re.search(r'von[\s]+(\d{1,2}:\d{2})', combined)
+                if m:
+                    start_time = m.group(1)
+            if not end_time:
+                m = re.search(r'bis[\s]+(\d{1,2}:\d{2})', combined)
+                if m:
+                    end_time = m.group(1)
+        # Last fallback: find all HH:MM times and use first two
+        if not start_time or not end_time:
+            combined = " ".join(all_texts)
+            times = re.findall(r'\b(\d{1,2}:\d{2})\b', combined)
+            if len(times) >= 2 and not start_time and not end_time:
+                start_time = times[0]
+                end_time = times[1]
+        if start_time or end_time:
+            log_and_broadcast(f"Zeiten erkannt: von {start_time} bis {end_time}")
+        return start_time, end_time
+
+    def _capture_ticket_detail(self, root) -> tuple[Optional[bytes], Optional[str], Optional[str], Optional[str]]:
+        """After a successful booking, tap the 'aktiver Parkschein' banner on the
+        booking screen to open the ticket detail view, take a screenshot,
+        then navigate back. Returns (png_bytes, ticket_number, start_time, end_time)."""
+        from lxml import etree as _etree
+        log_and_broadcast("Öffne Parkschein-Detail für Screenshot ...")
+
+        # The booking screen shows a green banner "Sie haben einen aktiven Parkschein"
+        # at the top. Look for it and tap it.
+        banner_node = None
+
+        # Search for the banner by text content
+        for n in root.iter():
+            text = (n.get("text") or "").lower()
+            if "aktiven parkschein" in text or "aktiver parkschein" in text:
+                banner_node = n
+                break
+
+        # Also try resource-id patterns
+        if banner_node is None:
+            for pattern in ["active_ticket_banner", "ticket_banner", "active_ticket",
+                            "banner_active", "aktiver_parkschein"]:
+                nodes = root.xpath(f'//node[contains(@resource-id,"{pattern}")]')
+                if nodes:
+                    banner_node = nodes[0]
+                    break
+
+        if banner_node is not None:
+            c = self._parse_bounds(banner_node.get("bounds", ""))
+            if c:
+                log_and_broadcast("Tippe auf 'aktiver Parkschein' Banner ...")
+                self.adb.run(["shell", "input", "tap", str(c[0]), str(c[1])])
+                time.sleep(3)
+
+                # Now on ticket detail screen — capture it
+                png = self.adb.screencap()
+                ticket_no = None
+                start_time = None
+                end_time = None
+
+                # Try to extract ticket number and times from detail view
+                xml3 = self._dump_ui()
+                if xml3:
+                    try:
+                        root3 = _etree.fromstring(xml3.encode())
+                        ticket_no = self._extract_ticket_number(root3)
+                        start_time, end_time = self._extract_ticket_times(root3)
+                        if ticket_no:
+                            log_and_broadcast(f"Parkschein-Nummer: {ticket_no}")
+                        if start_time and end_time:
+                            log_and_broadcast(f"Gültig: {start_time} – {end_time} Uhr")
+                    except _etree.XMLSyntaxError:
+                        pass
+
+                # Navigate back to booking screen
+                self.adb.run(["shell", "input", "keyevent", "KEYCODE_BACK"])
+                time.sleep(1.5)
+
+                log_and_broadcast("Parkschein-Detail erfasst.")
+                return png, ticket_no, start_time, end_time
+
+        # Fallback: no banner found — try scrolling up to reveal ticket area
+        log_and_broadcast("Banner nicht gefunden — scrolle nach oben ...")
+        self.adb.run(["shell", "input", "swipe", "360", "300", "360", "800", "300"])
+        time.sleep(2)
+        png = self.adb.screencap()
+        return png, None, None, None
+
     def _tap_buchen(self, root) -> bool:
         btn = root.xpath(f'//node[@resource-id="{PACKAGE}:id/btn_order_ticket" and @enabled="true"]')
         if not btn:
@@ -1010,8 +1164,8 @@ class BotController:
 
     # ── main cycle ────────────────────────────────────────────────────────────
 
-    def _run_cycle(self) -> tuple[bool, Optional[bytes], Optional[str]]:
-        """One full booking cycle. Returns (success, receipt_png, ticket_number)."""
+    def _run_cycle(self) -> tuple[bool, Optional[bytes], Optional[str], Optional[str], Optional[str]]:
+        """One full booking cycle. Returns (success, receipt_png, ticket_number, start_time, end_time)."""
         from lxml import etree
         deadline = time.time() + 180
         login_tried = False
@@ -1021,13 +1175,15 @@ class BotController:
         booking_submitted = False     # True after BUCHUNG BESTÄTIGEN was tapped
         receipt_png: Optional[bytes] = None
         receipt_ticket: Optional[str] = None
+        receipt_start: Optional[str] = None
+        receipt_end: Optional[str] = None
         receipt_captured = False
 
         while time.time() < deadline and self.running:
             xml = self._dump_ui()
             if xml is None:
                 log_and_broadcast("UI-Dump fehlgeschlagen.")
-                return False, None, None
+                return False, None, None, None, None
 
             try:
                 root = etree.fromstring(xml.encode())
@@ -1044,7 +1200,7 @@ class BotController:
             if self._is_login_screen(root):
                 if login_tried:
                     log_and_broadcast("Login fehlgeschlagen. Zugangsdaten prüfen.")
-                    return False, None, None
+                    return False, None, None, None, None
                 if self._do_login(root):
                     login_tried = True
                     log_and_broadcast("Warte auf Login-Erfolg ...")
@@ -1057,16 +1213,31 @@ class BotController:
 
             # ── After BUCHUNG BESTÄTIGEN was tapped ───────────────────────────
             if booking_submitted:
-                if self._is_booking_screen(root):
-                    log_and_broadcast("Parkschein erfolgreich gebucht!")
-                    return True, receipt_png, receipt_ticket
                 # Still on the preview/submit screen → press BACK
                 if root.xpath(f'//node[@resource-id="{PACKAGE}:id/orderpreview_submit"]'):
                     log_and_broadcast("Buchung abgeschlossen — zurück zur Buchungsansicht ...")
                     self.adb.run(["shell", "input", "keyevent", "KEYCODE_BACK"])
                     time.sleep(1.5)
                     continue
-                # Receipt / success screen — capture it once, then navigate back
+
+                # Back on booking screen → capture the actual ticket detail
+                if self._is_booking_screen(root):
+                    if not receipt_captured:
+                        receipt_png, receipt_ticket, receipt_start, receipt_end = self._capture_ticket_detail(root)
+                        receipt_captured = True
+                    log_and_broadcast("Parkschein erfolgreich gebucht!")
+                    return True, receipt_png, receipt_ticket, receipt_start, receipt_end
+
+                # Intermediate screen (e.g. "Parkschein wird gekauft") — wait
+                all_text = " ".join(
+                    (n.get("text") or "") for n in root.iter()
+                ).lower()
+                if "wird gekauft" in all_text or "wird gebucht" in all_text or "bitte warten" in all_text:
+                    log_and_broadcast("Parkschein wird gekauft — warte auf Bestätigung ...")
+                    time.sleep(3)
+                    continue
+
+                # Other unknown screen after submission — press BACK
                 if not receipt_captured:
                     receipt_png = self.adb.screencap()
                     receipt_ticket = self._extract_ticket_number(root)
@@ -1140,7 +1311,7 @@ class BotController:
             time.sleep(2)
 
         log_and_broadcast("Buchungs-Timeout überschritten.")
-        return False, None, None
+        return False, None, None, None, None
 
 
 # ── Globals & Startup ─────────────────────────────────────────────────────────
@@ -1200,12 +1371,14 @@ async def start_bot(body: dict):
         return {"error": "license_plate erforderlich"}
     try:
         duration_min = int(body.get("duration_min", DEFAULT_DURATION_MIN))
-        pause_min    = int(body.get("pause_min",    DEFAULT_PAUSE_MIN))
+        raw_pause = body.get("pause_min")
+        pause_min = int(raw_pause) if raw_pause is not None else None
     except (ValueError, TypeError):
         return {"error": "duration_min und pause_min müssen ganzzahlig sein"}
     bot_controller.start(plate, duration_min=duration_min, pause_min=pause_min)
+    effective_pause = pause_min if pause_min is not None else (duration_min + 2)
     return {"status": "started", "license_plate": plate,
-            "duration_min": duration_min, "pause_min": pause_min}
+            "duration_min": duration_min, "pause_min": effective_pause}
 
 
 @app.post("/stop")

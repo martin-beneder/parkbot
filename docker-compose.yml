@@ -6,6 +6,8 @@ services:
       - "5555:5555"
     volumes:
       - emulator_data:/data
+    command:
+      - androidboot.redroid_gpu_mode=guest
     restart: unless-stopped
 
   controller:
@@ -15,6 +17,7 @@ services:
     depends_on:
       - emulator
     environment:
+      - TZ=Europe/Vienna
       - ADB_HOST=emulator
       - ADB_PORT=5555
       - HP_LOGIN=${HP_LOGIN:-}
